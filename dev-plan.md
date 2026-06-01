@@ -150,24 +150,28 @@ END AI_DOC_META_GUIDANCE
 
 ## Project Summary
 
-Agents in Pi tend to jump into implementation during planning conversations, requiring constant correction. This extension adds a structured plan-then-execute workflow to Pi via three commands: `/plan-start` (constrained discussion mode), `/plan-finish` (generates plan doc from conversation), and `/next-step` (executes one step at a time with approval gates and auto-commit). The done condition is a globally installable Pi package that enforces this loop across any project.
+Agents in Pi tend to jump into implementation during planning conversations, requiring constant correction. This extension adds a structured plan-then-execute workflow to Pi via six commands: `/plan-start` (constrained discussion mode), `/plan-finish` (generates and commits plan doc to `docs/plans/`), `/activate-plan` (select a plan to work on, initializes state), `/next-step` (executes one step at a time with a custom approval/tweak/reject gate and auto-commit), `/auto-advance` (internal session handoff), and `/plan-close` (finalizes execution by updating relevant repo files and committing). The done condition is a globally installable Pi package that enforces this loop across any project.
 
 ---
 
 ## Goals & Success Criteria
 
 - `/plan-start` prevents the agent from writing any files or running bash during a planning conversation
-- `/plan-finish` generates a populated plan doc from conversation history and commits it
-- `/next-step` finds the next unchecked step, implements it, presents an approval gate, and on approval commits the work and marks the step complete
+- `/plan-finish` generates a populated plan doc from conversation history, writes it to `docs/plans/<name>.md`, and commits it
+- `/activate-plan` presents a select of available plans and initializes a state file tracking active plan and current step
+- `/next-step` reads state to find the current step, sends the full plan + step to the agent, and presents an approve/tweak/reject gate on completion
+- `/plan-close` reviews the completed plan and conversation, updates relevant repo files with captured decisions, and commits
 - The package is installable globally via local path and iterable with `/reload`
-- No filename arguments required at execution time — plan file path is configured once
 
 ---
 
 ## Relevant Files
 
 - `package.json` (add) — Pi package manifest
-- `extensions/index.ts` (add) — main extension implementing all three commands
+- `extensions/index.ts` (add) — main extension implementing all commands
+- `extensions/approval-component.ts` (add) — custom TUI component for approve/tweak/reject gate
+- `docs/plans/` (add) — directory where generated plan markdown files live
+- `.pi/plan-state.json` (add) — runtime state file tracking active plan and per-plan progress
 - `dev-plan.md` (add) — this file
 
 ---
@@ -175,22 +179,24 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 ## Constraints
 
 - Extension must work as a globally installed Pi package via local path
-- Plan file path is a single configured location, not passed as an argument to `/next-step`
+- No plan file path arguments at runtime — active plan is always read from state
 - `/plan-start` must hard-block `bash`, `write`, and `edit` tool calls — not just instruct the agent
-- Commits must be clean and atomic: one commit for the plan file, one per step
+- Commits must be clean and atomic: one commit for the plan file, one per step, one for plan-close updates
 - Must support `/reload` for iteration without reinstall
+- Step completion is tracked in state only — no `☑`/`☐` markers written to plan markdown
 
 ---
 
 ## Architecture & Design
 
-- Single extension file exporting a default factory function
-- In-memory state tracks: `planMode: boolean`, `activePlanFile: string`, `activeStep: { number, title } | null`
-- Plan file path configured via a hardcoded default (`dev-plan.md` relative to cwd) overridable in `.pi/settings.json`
+- Two extension files: `index.ts` (commands + event handlers) and `approval-component.ts` (pure TUI component)
+- In-memory state tracks: `planMode: boolean`, `activeStep: { number, title } | null`
+- Persistent state in `.pi/plan-state.json`: active plan path + per-plan `{ currentStep, completedSteps[] }` keyed by plan file path
+- Plan files live in `docs/plans/<name>.md`; no check markers — state file is sole source of truth for progress
 - `tool_call` event handler blocks `bash`/`write`/`edit` when `planMode` is true
-- `agent_end` event handler triggers approval dialog when a step is in progress
-- On approval, a follow-up command (`/auto-advance`) is queued via `pi.sendUserMessage()` to handle session transition — `ctx.newSession()` is only available in command handlers, not event handlers
-- New session is pre-seeded with the plan file content so `/next-step` has full context immediately
+- `agent_end` event handler shows `ApprovalComponent` when `activeStep` is set; tweak leaves `activeStep` set so the gate re-arms automatically on the next `agent_end`
+- On approval, `/auto-advance` is queued via `pi.sendUserMessage()` — `ctx.newSession()` is only available in command handlers, not event handlers
+- New session is pre-seeded with plan file content so `/next-step` has full context immediately
 
 ---
 
@@ -199,28 +205,44 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 **Commands registered:**
 
 ```
-/plan-start               — enters plan mode, augments system prompt, blocks destructive tools
-/plan-finish [file]       — exits plan mode, generates plan doc, commits it
-/next-step                — finds next ☐ step, sends to agent, arms approval gate on agent_end
-/auto-advance             — internal; queued after approval to handle session reset and next step
+/plan-start        — enters plan mode, augments system prompt, blocks destructive tools
+/plan-finish       — exits plan mode, agent generates plan doc, writes to docs/plans/<name>.md, commits
+/activate-plan     — select from docs/plans/*.md, write/update state file, set currentStep to 1
+/next-step         — read state for current step, send full plan + step to agent, arm approval gate
+/auto-advance      — internal; update state to next step, new session pre-seeded with plan, queue /next-step
+/plan-close        — review plan + thread, update relevant repo files, commit
 ```
 
-**Plan file step format (read/write):**
+**Plan file step format (read-only at runtime):**
 
 ```markdown
 ## Steps
 
 #### Step 1 — Some Title
 
+**Recipe**
 ...
 
-## Step Checklist (implicit — tracked via ☐/☑ in step headings or a checklist block)
+**Verify**
+...
 ```
 
-**Settings shape:**
+**State file shape (`.pi/plan-state.json`):**
 
 ```json
-{ "planFile": "dev-plan.md" }
+{
+  "activePlan": "docs/plans/auth-refactor.md",
+  "plans": {
+    "docs/plans/auth-refactor.md": {
+      "currentStep": 3,
+      "completedSteps": [1, 2]
+    },
+    "docs/plans/api-redesign.md": {
+      "currentStep": 1,
+      "completedSteps": []
+    }
+  }
+}
 ```
 
 ---
@@ -236,17 +258,18 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 
 ## Risks / Unknowns
 
-- **Approval dialog timing** — `agent_end` fires after all tool calls; need to confirm `ctx.ui.confirm()` is available and doesn't race with Pi returning to idle → validate in Step 3
-- **Session handoff** — `ctx.newSession()` can only be called from command handlers; approval gate queues `/auto-advance` as a follow-up, which means a brief window where the old session is still active → verify no state leaks between steps
+- **Approval gate timing** — `agent_end` fires after all tool calls; `ctx.ui.custom()` must be available here and not race with Pi returning to idle → validate in Step 5
+- **Session handoff** — `ctx.newSession()` can only be called from command handlers; approval gate queues `/auto-advance` as a follow-up → verify no state leaks between steps
 - **Plan generation quality** — the `/plan-finish` prompt needs to reliably produce well-structured output from varied conversations → may need prompt tuning after first use
-- **Step parsing** — extracting step title and body from the markdown requires reliable regex against the template format → test against malformed docs
+- **State file corruption** — if a session is killed mid-step, `currentStep` may point to a step that was partially implemented → acceptable risk for now, user can manually edit state
 
 ---
 
 ## Decision Log
 
 - **2026-06-01** — Hard-block tools in plan mode rather than relying on system prompt instruction. Rationale: agents ignore instructions under pressure; hard blocking is the only reliable enforcement.
-- **2026-06-01** — Single configured plan file path rather than per-command argument. Rationale: eliminates repetitive typing and the risk of pointing at the wrong file mid-session.
+- **2026-06-01** — State file (not markdown markers) tracks step completion. Rationale: keeps plan docs as clean, readable documents; supports switching between multiple active plans without corrupting markdown.
+- **2026-06-01** — Plans live in `docs/plans/` not root. Rationale: keeps repo root clean, makes plans discoverable by `/activate-plan` without configuration.
 - **2026-06-01** — Local path install for iteration, git remote for distribution. Rationale: Pi resolves local paths without copying, so `/reload` is sufficient for the inner loop.
 
 ---
@@ -304,6 +327,87 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 - [ ] On approval, plan file is updated and a clean commit is created
 - [ ] New session starts automatically, pre-seeded with plan file, with `/next-step` already queued
 - [ ] On rejection, state is cleared cleanly and user can re-run
+
+---
+
+#### Step 4 — Add state file, `/activate-plan`, and refactor `/next-step` and `/auto-advance` to be state-driven
+
+**Recipe**
+
+1. Add `readState(cwd)` and `writeState(cwd, state)` helpers that read/write `.pi/plan-state.json` with shape `{ activePlan, plans: { [path]: { currentStep, completedSteps[] } } }`. Create `docs/plans/` directory if absent.
+2. Implement `/activate-plan`: scan `docs/plans/` for `*.md` files, present via `ctx.ui.select()`, write/update state setting `activePlan` to chosen path and initializing `{ currentStep: 1, completedSteps: [] }` if not already tracked.
+3. Refactor `/next-step`: remove markdown `☐` scanning; instead read `activePlan` and `currentStep` from state, read that step's content from the plan markdown by step number, send full plan + "implement Step N" to agent, set `activeStep: { number, title }` in memory.
+4. Refactor `/auto-advance`: after approval, increment `currentStep` in state and write state before starting the new session. Remove `markStepComplete` markdown mutation.
+5. Update `/plan-finish` to instruct the agent to write the plan to `docs/plans/<name>.md` (agent picks a slug from the plan title) rather than `dev-plan.md`.
+
+**Verify**
+
+- [ ] `/activate-plan` lists `docs/plans/` files and writes state correctly
+- [ ] `/next-step` dispatches the step number from state, not from `☐` scanning
+- [ ] Completing a step increments `currentStep` in state; re-running `/next-step` dispatches the next step
+- [ ] Switching plans via `/activate-plan` preserves progress on the previously active plan
+- [ ] `/plan-finish` writes the plan under `docs/plans/`
+
+---
+
+#### Step 5 — Build `ApprovalComponent` TUI class
+
+**Recipe**
+
+1. Create `extensions/approval-component.ts` exporting `ApprovalAction` (`"approve" | "tweak" | "reject"`) and `ApprovalComponent` implementing the `Component` interface from `@earendil-works/pi-tui`.
+2. Constructor accepts `diffLines: string[]` (pre-truncated, ready to render) and `onDone: (action: ApprovalAction) => void`.
+3. `render()` outputs the diff lines, then a blank line, then the three options with a `>` cursor on the selected one, styled with the theme.
+4. `handleInput()`: up/down moves the cursor, Enter calls `onDone()` with the selected action.
+
+**Verify**
+
+- [ ] Component renders diff block and three options without errors
+- [ ] Arrow keys move selection, Enter on each option calls `onDone` with the correct action
+
+**Notes**
+
+- Keep this file free of any `pi` or `ctx` references — it is pure TUI, testable in isolation
+- No input handling needed inside the component; tweak feedback is collected separately via `ctx.ui.input()` after the component closes
+
+---
+
+#### Step 6 — Wire `ApprovalComponent` into `agent_end` and implement all three outcome flows
+
+**Recipe**
+
+1. In `agent_end`, replace the `ctx.ui.confirm()` call with: run `pi.exec("git", ["diff", "--stat"])`, parse the output into file-change lines, truncate to 10 lines (append `  ...and N more files` if truncated), pass to `ApprovalComponent`, and open via `ctx.ui.custom()`.
+2. On **approve**: parse the full `git diff --stat` output to extract changed filenames; derive a commit message formatted as `Step N: update foo.ts, bar.ts[, and N more]`; run `git add -A && git commit -m <message>`; update state to add current step to `completedSteps`; clear `activeStep`; queue `/auto-advance` via `pi.sendUserMessage`.
+3. On **tweak**: call `ctx.ui.input("What do you want to change?")` to collect feedback, then send it as a `followUp` user message via `pi.sendUserMessage`; do NOT clear `activeStep` — it remains set so `agent_end` fires again after the agent finishes, re-entering this same flow with a fresh diff.
+4. On **reject**: clear `activeStep`; call `ctx.ui.notify` telling the user to give feedback and re-run `/next-step`.
+
+**Verify**
+
+- [ ] Approval UI shows truncated diff and three options in a single view after agent finishes a step
+- [ ] Approve commits with a message derived from the diff filenames, not the step title
+- [ ] Tweak sends feedback to the agent and the approval UI reappears after the next `agent_end` with a fresh diff
+- [ ] Reject clears state cleanly and notifies the user
+
+**Notes**
+
+- Commit message derivation: split `git diff --stat` lines, filter to lines matching `filename |`, extract names, join first 3 with `, and N more` suffix if needed
+- The tweak loop requires zero extra state — `activeStep` staying set is the entire mechanism
+
+---
+
+#### Step 7 — Implement `/plan-close`
+
+**Recipe**
+
+1. `/plan-close` reads the active plan file path from state and the plan markdown content.
+2. Sends the agent a message with the full plan content + instruction to: review the plan, review the current conversation thread, identify any other files in the repo that should be updated with decisions or outcomes from this plan (READMEs, architecture docs, AGENTS.md, etc.), and make those updates.
+3. After the agent finishes, commit all changes with message `plan-close: <plan name>`.
+4. Update state to clear `activePlan` (or mark the plan as closed).
+
+**Verify**
+
+- [ ] `/plan-close` sends the agent the plan content and a clear instruction to update relevant repo files
+- [ ] All file updates are committed in a single clean commit
+- [ ] State is updated to reflect the plan is no longer active
 
 ---
 
