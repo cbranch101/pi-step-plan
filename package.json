@@ -2,12 +2,32 @@
   "name": "pi-step-plan",
   "version": "0.1.0",
   "description": "Structured plan-then-execute workflow for Pi — plan mode, plan generation, and step-by-step execution with approval gates",
-  "keywords": ["pi-package"],
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "lint": "eslint extensions/",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@eslint/js": "^9.39.4",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3",
+    "typescript-eslint": "^8.60.1",
+    "typescript-language-server": "^5.3.0"
   }
 }

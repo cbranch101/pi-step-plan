@@ -1,145 +1,145 @@
 <!--
 AI_DOC_META_GUIDANCE (PERSISTENT) — v4.0
 
-PURPOSE  
-This document defines a **self-contained implementation plan** executable by humans or AI tools (e.g. Cursor) without prior chat or memory context.  
+PURPOSE
+This document defines a **self-contained implementation plan** executable by humans or AI tools (e.g. Cursor) without prior chat or memory context.
 It describes *only* what is required to complete this specific phase of work — no historical or operational padding.
 
 ───────────────────────────────
-## CORE PRINCIPLES  
-1. Capture **only what changes**, not what exists already.  
-2. Focus on **decisions, boundaries, and actions**, not mechanics.  
-3. Write for **execution** — every statement should inform a concrete task or validation.  
-4. Avoid redundancy: information appears exactly once.  
+## CORE PRINCIPLES
+1. Capture **only what changes**, not what exists already.
+2. Focus on **decisions, boundaries, and actions**, not mechanics.
+3. Write for **execution** — every statement should inform a concrete task or validation.
+4. Avoid redundancy: information appears exactly once.
 5. Document **phase scope** clearly; defer unrelated work to a "Future Phase" section.
 
 ───────────────────────────────
-## STRUCTURAL RULES  
-- This meta block must remain in all versions of the doc.  
-- Append new Steps to the end; do not renumber completed ones.  
-- Each Step must map to one checklist item.  
-- Remove placeholder comments after first population.  
-- For interfaces, dependencies, or workflows that are unchanged, simply mark `"Unchanged"` — do not restate.  
+## STRUCTURAL RULES
+- This meta block must remain in all versions of the doc.
+- Append new Steps to the end; do not renumber completed ones.
+- Each Step must map to one checklist item.
+- Remove placeholder comments after first population.
+- For interfaces, dependencies, or workflows that are unchanged, simply mark `"Unchanged"` — do not restate.
 - Use concise bulleting and line limits per section to maintain readability.
 
 ───────────────────────────────
 ## SECTION RULES
 
-### Project Summary  
-**Goal:** Define the current phase scope and desired end state.  
-**Include:**  
-- 2–4 sentences describing the *problem*, *system impact*, and *done condition* for this phase only.  
-**Exclude:**  
-- Long-term context, previous architecture, or future-phase plans.  
+### Project Summary
+**Goal:** Define the current phase scope and desired end state.
+**Include:**
+- 2–4 sentences describing the *problem*, *system impact*, and *done condition* for this phase only.
+**Exclude:**
+- Long-term context, previous architecture, or future-phase plans.
 
 ---
 
-### Goals & Success Criteria  
-**Goal:** Define measurable outcomes and new capabilities introduced by this phase.  
-**Include:**  
-- 3–5 bullets describing success in behavioral or capability terms (e.g. "cross-job imports enabled").  
-**Exclude:**  
-- Runtime validation items (those belong in Step "Verify").  
-- UI or operational descriptions.  
+### Goals & Success Criteria
+**Goal:** Define measurable outcomes and new capabilities introduced by this phase.
+**Include:**
+- 3–5 bullets describing success in behavioral or capability terms (e.g. "cross-job imports enabled").
+**Exclude:**
+- Runtime validation items (those belong in Step "Verify").
+- UI or operational descriptions.
 
 ---
 
-### Relevant Files  
-**Goal:** Scope the file-level changes.  
-**Include:**  
-- Only files or directories to be created, modified, or deleted.  
-- Annotate each with action: `(add)`, `(modify)`, `(remove)`.  
-**Exclude:**  
-- Unchanged files or configs.  
+### Relevant Files
+**Goal:** Scope the file-level changes.
+**Include:**
+- Only files or directories to be created, modified, or deleted.
+- Annotate each with action: `(add)`, `(modify)`, `(remove)`.
+**Exclude:**
+- Unchanged files or configs.
 
 ---
 
-### Constraints  
-**Goal:** Define hard boundaries or external rules that cannot change.  
-**Include:**  
-- 3–6 one-line runtime, infrastructure, or policy constraints.  
-**Exclude:**  
-- Goals, risks, or success criteria (move elsewhere).  
-**Merge:** If multiple bullets describe the same limitation, merge into one.  
+### Constraints
+**Goal:** Define hard boundaries or external rules that cannot change.
+**Include:**
+- 3–6 one-line runtime, infrastructure, or policy constraints.
+**Exclude:**
+- Goals, risks, or success criteria (move elsewhere).
+**Merge:** If multiple bullets describe the same limitation, merge into one.
 
 ---
 
-### Architecture & Design  
-**Goal:** Summarize structural deltas introduced by this change.  
-**Include:**  
-- ≤5 concise deltas (directory, dependency, build, import, or testability).  
-- Optional short "Before → After" block or diff.  
-**Exclude:**  
-- Full pre-existing system descriptions or unchanged flows.  
+### Architecture & Design
+**Goal:** Summarize structural deltas introduced by this change.
+**Include:**
+- ≤5 concise deltas (directory, dependency, build, import, or testability).
+- Optional short "Before → After" block or diff.
+**Exclude:**
+- Full pre-existing system descriptions or unchanged flows.
 
 ---
 
-### Interfaces & Contracts  
-**Goal:** Capture new or modified integration boundaries.  
-**Include:**  
-- Only interfaces that change (APIs, data schemas, build workflows, import paths).  
-- ≤3 code or YAML snippets illustrating format or usage.  
-**Exclude:**  
-- Unchanged contracts; instead write "Unchanged."  
+### Interfaces & Contracts
+**Goal:** Capture new or modified integration boundaries.
+**Include:**
+- Only interfaces that change (APIs, data schemas, build workflows, import paths).
+- ≤3 code or YAML snippets illustrating format or usage.
+**Exclude:**
+- Unchanged contracts; instead write "Unchanged."
 
 ---
 
-### Dependencies  
-**Goal:** Describe dependency-level changes and expected lock outcomes.  
-**Include:**  
-- Grouped overview (Shared / Job-Specific / Build-Time / Secrets).  
-- Mention new additions, removals, or expected conflicts.  
-- End with **Outcome:** 1 line summarizing what successful resolution looks like.  
-**Exclude:**  
-- Full version pins or lists.  
+### Dependencies
+**Goal:** Describe dependency-level changes and expected lock outcomes.
+**Include:**
+- Grouped overview (Shared / Job-Specific / Build-Time / Secrets).
+- Mention new additions, removals, or expected conflicts.
+- End with **Outcome:** 1 line summarizing what successful resolution looks like.
+**Exclude:**
+- Full version pins or lists.
 
 ---
 
-### Risks / Unknowns  
-**Goal:** Identify and mitigate meaningful technical risks.  
-**Include:**  
-- ≤5 risks, each ≤2 lines: "Risk → Mitigation / Validation."  
-**Exclude:**  
-- Performance metrics, success criteria, or test details.  
+### Risks / Unknowns
+**Goal:** Identify and mitigate meaningful technical risks.
+**Include:**
+- ≤5 risks, each ≤2 lines: "Risk → Mitigation / Validation."
+**Exclude:**
+- Performance metrics, success criteria, or test details.
 
 ---
 
-### Decision Log  
-**Goal:** Record why key choices were made.  
-**Include:**  
-- Each decision ≤3 lines: date, rationale, tradeoff, and alternatives if relevant.  
-**Exclude:**  
-- Implementation detail or command syntax.  
+### Decision Log
+**Goal:** Record why key choices were made.
+**Include:**
+- Each decision ≤3 lines: date, rationale, tradeoff, and alternatives if relevant.
+**Exclude:**
+- Implementation detail or command syntax.
 
 ---
 
-### Steps  
-Each Step = one atomic unit of work that produces a testable outcome.  
+### Steps
+Each Step = one atomic unit of work that produces a testable outcome.
 
-#### Step N — <Action-Oriented Title>  
+#### Step N — <Action-Oriented Title>
 
-**Recipe**  
-1) Describe *what changes*, not *how to click or run commands*.  
-2) Reference affected file(s) or function(s).  
-3) Summarize commands or processes generically.  
-4) Keep ≤4 bullets total.  
+**Recipe**
+1) Describe *what changes*, not *how to click or run commands*.
+2) Reference affected file(s) or function(s).
+3) Summarize commands or processes generically.
+4) Keep ≤4 bullets total.
 
-**Verify**  
-- [ ] Behavioral outcome.  
-- [ ] Integration validation.  
-- [ ] At most 3 checks total.  
+**Verify**
+- [ ] Behavioral outcome.
+- [ ] Integration validation.
+- [ ] At most 3 checks total.
 
-**Notes (optional)**  
-- 1–2 lines: rationale, risk link, or implementation nuance.  
+**Notes (optional)**
+- 1–2 lines: rationale, risk link, or implementation nuance.
 
 ---
 
-### Phase N (Future Work)  
-**Goal:** Record planned follow-up work without diluting current scope.  
-**Include:**  
-- ≤3 concise bullets describing deferred actions or future phase intent.  
-**Exclude:**  
-- Current-phase work or speculative details.  
+### Phase N (Future Work)
+**Goal:** Record planned follow-up work without diluting current scope.
+**Include:**
+- ≤3 concise bullets describing deferred actions or future phase intent.
+**Exclude:**
+- Current-phase work or speculative details.
 
 END AI_DOC_META_GUIDANCE
 -->
@@ -197,6 +197,7 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 ## Interfaces & Contracts
 
 **Commands registered:**
+
 ```
 /plan-start               — enters plan mode, augments system prompt, blocks destructive tools
 /plan-finish [file]       — exits plan mode, generates plan doc, commits it
@@ -205,15 +206,19 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 ```
 
 **Plan file step format (read/write):**
+
 ```markdown
 ## Steps
+
 #### Step 1 — Some Title
+
 ...
 
 ## Step Checklist (implicit — tracked via ☐/☑ in step headings or a checklist block)
 ```
 
 **Settings shape:**
+
 ```json
 { "planFile": "dev-plan.md" }
 ```
@@ -251,11 +256,13 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 #### Step 1 — Scaffold package structure
 
 **Recipe**
-1) Create `package.json` with Pi package manifest, `pi-package` keyword, and peer dependencies.
-2) Create `extensions/index.ts` with empty default export and the three command stubs (`/plan-start`, `/plan-finish`, `/next-step`).
-3) Install locally via `pi install ~/code/pi-step-plan` and verify Pi loads the extension on startup.
+
+1. Create `package.json` with Pi package manifest, `pi-package` keyword, and peer dependencies.
+2. Create `extensions/index.ts` with empty default export and the three command stubs (`/plan-start`, `/plan-finish`, `/next-step`).
+3. Install locally via `pi install ~/code/pi-step-plan` and verify Pi loads the extension on startup.
 
 **Verify**
+
 - [ ] Pi startup shows the extension loaded with no errors
 - [ ] `/plan-start`, `/plan-finish`, `/next-step` appear as available commands
 - [ ] `/reload` after a no-op edit to `index.ts` reloads cleanly
@@ -265,12 +272,14 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 #### Step 2 — Implement `/plan-start` and `/plan-finish`
 
 **Recipe**
-1) In `tool_call` handler, block `bash`, `write`, and `edit` when `planMode` is true; notify user of the block.
-2) In `before_agent_start`, inject a system prompt addition when `planMode` is true: agent is in planning mode, discussion only.
-3) `/plan-start` sets `planMode = true` and notifies user.
-4) `/plan-finish` sets `planMode = false`, sends the agent a message instructing it to generate the plan doc from conversation history using the embedded template, writes to the configured path, and commits.
+
+1. In `tool_call` handler, block `bash`, `write`, and `edit` when `planMode` is true; notify user of the block.
+2. In `before_agent_start`, inject a system prompt addition when `planMode` is true: agent is in planning mode, discussion only.
+3. `/plan-start` sets `planMode = true` and notifies user.
+4. `/plan-finish` sets `planMode = false`, sends the agent a message instructing it to generate the plan doc from conversation history using the embedded template, writes to the configured path, and commits.
 
 **Verify**
+
 - [ ] In plan mode, any agent attempt to call `bash`/`write`/`edit` is blocked with a user notification
 - [ ] `/plan-finish` produces a populated markdown file at the configured path
 - [ ] A clean git commit is created containing only the plan file
@@ -280,14 +289,16 @@ Agents in Pi tend to jump into implementation during planning conversations, req
 #### Step 3 — Implement `/next-step` with approval gate
 
 **Recipe**
-1) `/next-step` reads the configured plan file, finds the first `☐` step, extracts its title and Recipe/Verify/Notes body, and sends it to the agent as a user message.
-2) Extension sets `activeStep` in memory when a step is dispatched.
-3) `agent_end` handler: if `activeStep` is set, show `ctx.ui.confirm()` approval dialog.
-4) On approve: run `git add -A && git commit`, update the plan file to flip `☐ → ☑` for the completed step, clear `activeStep`, then queue `/auto-advance` as a follow-up user message.
-5) `/auto-advance` command calls `ctx.newSession()` with setup that injects the plan file content as initial context, then sends `/next-step` into the new session.
-6) On reject: clear `activeStep`, notify user to provide feedback and re-run `/next-step` when ready.
+
+1. `/next-step` reads the configured plan file, finds the first `☐` step, extracts its title and Recipe/Verify/Notes body, and sends it to the agent as a user message.
+2. Extension sets `activeStep` in memory when a step is dispatched.
+3. `agent_end` handler: if `activeStep` is set, show `ctx.ui.confirm()` approval dialog.
+4. On approve: run `git add -A && git commit`, update the plan file to flip `☐ → ☑` for the completed step, clear `activeStep`, then queue `/auto-advance` as a follow-up user message.
+5. `/auto-advance` command calls `ctx.newSession()` with setup that injects the plan file content as initial context, then sends `/next-step` into the new session.
+6. On reject: clear `activeStep`, notify user to provide feedback and re-run `/next-step` when ready.
 
 **Verify**
+
 - [ ] `/next-step` correctly identifies and dispatches the first unchecked step
 - [ ] Approval dialog appears after agent finishes work
 - [ ] On approval, plan file is updated and a clean commit is created
