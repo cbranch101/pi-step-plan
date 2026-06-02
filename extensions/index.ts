@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // ─── Embedded plan doc template ───────────────────────────────────────────────
@@ -112,17 +112,29 @@ END AI_DOC_META_GUIDANCE
 - [Deferred action or future phase intent]
 `;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── State file ───────────────────────────────────────────────────────────────
 
-function getPlanFile(cwd: string): string {
-  try {
-    const settingsPath = join(cwd, ".pi", "settings.json");
-    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as { planFile?: string };
-    if (settings.planFile) return join(cwd, settings.planFile);
-  } catch {
-    // fall through to default
-  }
-  return join(cwd, "dev-plan.md");
+interface PlanProgress {
+  currentStep: number;
+  completedSteps: number[];
+}
+
+interface PlanState {
+  activePlan: string | null;
+  plans: Record<string, PlanProgress>;
+}
+
+const PLANS_DIR = "docs/plans";
+const STATE_FILE = ".pi/plan-state.json";
+
+async function readState(cwd: string): Promise<PlanState> {
+  const raw = await readFile(join(cwd, STATE_FILE), "utf8").catch(() => null);
+  return raw ? (JSON.parse(raw) as PlanState) : { activePlan: null, plans: {} };
+}
+
+async function writeState(cwd: string, state: PlanState): Promise<void> {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await writeFile(join(cwd, STATE_FILE), JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
 // ─── Step parsing ────────────────────────────────────────────────────────────
@@ -131,56 +143,42 @@ interface ActiveStep {
   number: number;
   title: string;
   body: string;
-  rawHeading: string; // the exact "#### Step N — Title" line as written
 }
 
 /**
- * Find the first step with a ☐ checkbox in the heading.
- * Returns null if none found.
+ * Extract a specific step's content by step number from a plan markdown file.
+ * Returns null if the step number is not found.
  */
-function findNextStep(content: string): ActiveStep | null {
-  // Match "#### Step N — Title" lines where N and title follow the heading
-  const stepHeadingRe = /^#### Step (\d+) — (.+)$/m;
+function findStepByNumber(content: string, stepNumber: number): ActiveStep | null {
   const lines = content.split("\n");
+  const stepHeadingRe = /^#### Step (\d+) — (.+)$/;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Look for headings that haven't been checked off
-    // Checked steps have ☑ somewhere in the heading; unchecked have no ☑
-    const match = line.match(stepHeadingRe);
+    const match = lines[i].match(stepHeadingRe);
     if (!match) continue;
+    if (parseInt(match[1], 10) !== stepNumber) continue;
 
-    // Check if this step is already completed (☑ in the line)
-    if (line.includes("☑")) continue;
-
-    const number = parseInt(match[1], 10);
     const title = match[2].trim();
-    const rawHeading = line;
 
-    // Collect body: everything from the next line until the next #### heading or end
+    // Collect body: lines until the next #### or ## heading or end of file
     const bodyLines: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
       if (lines[j].startsWith("#### ") || lines[j].startsWith("## ")) break;
       bodyLines.push(lines[j]);
     }
 
-    return { number, title, body: bodyLines.join("\n").trim(), rawHeading };
+    return { number: stepNumber, title, body: bodyLines.join("\n").trim() };
   }
 
   return null;
 }
 
 /**
- * Flip the first occurrence of rawHeading in content from ☐ to ☑ (or mark as done).
- * Since the heading itself doesn't contain ☐, we mark it by appending ☑ to the heading.
+ * Count total steps in a plan file.
  */
-function markStepComplete(content: string, step: ActiveStep): string {
-  // Replace the exact heading with a version that has ☑ prepended to the title
-  const completed = step.rawHeading.replace(
-    `Step ${step.number} — ${step.title}`,
-    `Step ${step.number} — ☑ ${step.title}`,
-  );
-  return content.replace(step.rawHeading, completed);
+function countSteps(content: string): number {
+  const matches = content.match(/^#### Step \d+ — /gm);
+  return matches ? matches.length : 0;
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
@@ -249,23 +247,82 @@ export default function (pi: ExtensionAPI) {
   // ── /plan-finish ─────────────────────────────────────────────────────────────
   pi.registerCommand("plan-finish", {
     description: "Exit planning mode and generate a populated plan doc from the conversation",
-    handler: (_args, ctx) => {
+    handler: async (_args, ctx) => {
       planMode = false;
-      const planFile = getPlanFile(ctx.cwd);
+      await mkdir(join(ctx.cwd, PLANS_DIR), { recursive: true });
+      const plansDir = join(ctx.cwd, PLANS_DIR);
 
-      ctx.ui.notify(`Plan mode disabled. Asking agent to generate plan doc → ${planFile}`, "info");
+      ctx.ui.notify(
+        `Plan mode disabled. Asking agent to generate plan doc → ${plansDir}/<slug>.md`,
+        "info",
+      );
 
       pi.sendUserMessage(
         `Our planning discussion is complete. Please do the following now:\n\n` +
           `1. Review our full conversation above and extract all decisions, goals, constraints, ` +
           `architecture choices, and action items.\n` +
-          `2. Write a populated plan doc to \`${planFile}\` using the template below. ` +
+          `2. Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign").\n` +
+          `3. Write a populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. ` +
           `Fill in every section from our conversation — do not leave placeholders.\n` +
-          `3. After writing the file, run: \`git add -A && git commit -m "Add plan doc"\`\n\n` +
+          `4. After writing the file, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
-      return Promise.resolve();
+    },
+  });
+
+  // ── /activate-plan ──────────────────────────────────────────────────────────
+  pi.registerCommand("activate-plan", {
+    description: "Select a plan from docs/plans/ and set it as the active plan",
+    handler: async (_args, ctx) => {
+      await mkdir(join(ctx.cwd, PLANS_DIR), { recursive: true });
+      const files = (await readdir(join(ctx.cwd, PLANS_DIR)))
+        .filter((f) => f.endsWith(".md"))
+        .sort();
+
+      if (files.length === 0) {
+        ctx.ui.notify(
+          `No plan files found in ${PLANS_DIR}/. Run /plan-finish to generate one.`,
+          "warning",
+        );
+        return;
+      }
+
+      const state = await readState(ctx.cwd);
+
+      // Build display options: show current step progress if tracked
+      const options = files.map((f) => {
+        const planPath = `${PLANS_DIR}/${f}`;
+        const progress = state.plans[planPath];
+        const suffix = progress
+          ? ` (step ${progress.currentStep}, done: [${progress.completedSteps.join(", ")}])`
+          : " (new)";
+        return `${f}${suffix}`;
+      });
+
+      const selected = await ctx.ui.select("Select a plan to activate", options);
+      if (!selected) {
+        ctx.ui.notify("No plan selected.", "info");
+        return;
+      }
+
+      // Extract filename from display string
+      const selectedFile = files[options.indexOf(selected)];
+      const planPath = `${PLANS_DIR}/${selectedFile}`;
+
+      // Initialize state for this plan if not already tracked
+      if (!state.plans[planPath]) {
+        state.plans[planPath] = { currentStep: 1, completedSteps: [] };
+      }
+      state.activePlan = planPath;
+      await writeState(ctx.cwd, state);
+
+      const progress = state.plans[planPath];
+      ctx.ui.notify(
+        `✅ Active plan set to: ${planPath}\n` +
+          `Current step: ${progress.currentStep} | Completed: [${progress.completedSteps.join(", ")}]`,
+        "info",
+      );
     },
   });
 
@@ -274,7 +331,8 @@ export default function (pi: ExtensionAPI) {
     if (!activeStep || !ctx.hasUI) return;
 
     const step = activeStep;
-    const planFile = getPlanFile(ctx.cwd);
+    const state = await readState(ctx.cwd);
+    const planPath = state.activePlan;
 
     const approved = await ctx.ui.confirm(
       `✅ Step ${step.number} complete?`,
@@ -304,22 +362,14 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Committed: Step ${step.number} — ${step.title}`, "info");
     }
 
-    // Mark step complete in plan file
-    try {
-      const content = readFileSync(planFile, "utf8");
-      const updated = markStepComplete(content, step);
-      writeFileSync(planFile, updated, "utf8");
-
-      // Commit the updated plan file
-      await pi.exec("git", ["add", planFile]);
-      await pi.exec("git", [
-        "commit",
-        "--allow-empty",
-        "-m",
-        `Mark Step ${step.number} complete in plan`,
-      ]);
-    } catch (err) {
-      ctx.ui.notify(`Failed to update plan file: ${String(err)}`, "error");
+    // Update state: mark step completed and advance currentStep
+    if (planPath && state.plans[planPath]) {
+      const progress = state.plans[planPath];
+      if (!progress.completedSteps.includes(step.number)) {
+        progress.completedSteps.push(step.number);
+      }
+      progress.currentStep = step.number + 1;
+      await writeState(ctx.cwd, state);
     }
 
     // Clear active step, then queue /auto-advance
@@ -329,35 +379,51 @@ export default function (pi: ExtensionAPI) {
 
   // ── /next-step ───────────────────────────────────────────────────────────────
   pi.registerCommand("next-step", {
-    description: "Find the next unchecked step in the plan and dispatch it to the agent",
-    handler: (_args, ctx) => {
-      const planFile = getPlanFile(ctx.cwd);
+    description: "Dispatch the current step from the active plan to the agent",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
 
-      let content: string;
-      try {
-        content = readFileSync(planFile, "utf8");
-      } catch {
-        ctx.ui.notify(`Cannot read plan file: ${planFile}`, "error");
-        return Promise.resolve();
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan. Run /activate-plan to select one.", "warning");
+        return;
       }
 
-      const step = findNextStep(content);
+      const planPath = state.activePlan;
+      const progress = state.plans[planPath] ?? { currentStep: 1, completedSteps: [] };
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      const totalSteps = countSteps(planContent);
+      const stepNumber = progress.currentStep;
+
+      if (stepNumber > totalSteps) {
+        ctx.ui.notify(`🎉 All ${totalSteps} steps complete! Run /plan-close to finalize.`, "info");
+        return;
+      }
+
+      const step = findStepByNumber(planContent, stepNumber);
       if (!step) {
-        ctx.ui.notify("🎉 All steps are complete! No remaining ☐ steps found.", "info");
-        return Promise.resolve();
+        ctx.ui.notify(`Step ${stepNumber} not found in ${planPath}. Check the plan file.`, "error");
+        return;
       }
 
       activeStep = step;
       ctx.ui.notify(`Dispatching Step ${step.number}: ${step.title}`, "info");
 
       const message =
-        `## Plan\n\n${content}\n\n---\n\n` +
+        `## Plan\n\n${planContent}\n\n---\n\n` +
         `## Your task\n\n` +
-        `Implement **Step ${step.number} — ${step.title}** (marked above).\n\n` +
+        `Implement **Step ${step.number} — ${step.title}**.\n\n` +
+        `Step content:\n\n${step.body}\n\n` +
         `When done, stop — do not proceed to any other steps.`;
 
       pi.sendUserMessage(message, { deliverAs: "followUp" });
-      return Promise.resolve();
     },
   });
 
@@ -365,38 +431,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("auto-advance", {
     description: "Internal: start a new session pre-seeded with plan context and run /next-step",
     handler: async (_args, ctx) => {
-      const planFile = getPlanFile(ctx.cwd);
-
-      let planContent = "";
-      try {
-        planContent = readFileSync(planFile, "utf8");
-      } catch {
-        // Plan file may not exist yet; continue without it
-      }
-
-      const currentSession = ctx.sessionManager.getSessionFile();
-      const planContentSnapshot = planContent; // capture before session teardown
-
       const result = await ctx.newSession({
-        parentSession: currentSession,
-        setup: async (sm) => {
-          if (planContentSnapshot) {
-            sm.appendMessage({
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `## Current Plan\n\nHere is the current state of the plan file (${planFile}):\n\n` +
-                    "```markdown\n" +
-                    planContentSnapshot +
-                    "\n```\n\nPlan loaded. Ready to implement the next step.",
-                },
-              ],
-              timestamp: Date.now(),
-            });
-          }
-        },
         withSession: async (replacementCtx) => {
           await replacementCtx.sendUserMessage("/next-step");
         },
@@ -405,6 +440,46 @@ export default function (pi: ExtensionAPI) {
       if (result.cancelled) {
         ctx.ui.notify("New session cancelled — run /next-step manually to continue.", "warning");
       }
+    },
+  });
+
+  // ── /plan-close ──────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-close", {
+    description: "Finalize the active plan: update relevant repo files and commit",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan to close. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      ctx.ui.notify(`Closing plan: ${planPath}`, "info");
+
+      pi.sendUserMessage(
+        `The active plan has been completed. Please do the following:\n\n` +
+          `1. Review the full plan below and the current conversation thread.\n` +
+          `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
+          `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
+          `3. Make those updates now.\n` +
+          `4. After all updates, run: \`git add -A && git commit -m "plan-close: ${planPath}"\`\n\n` +
+          `## Plan content\n\n${planContent}`,
+        { deliverAs: "followUp" },
+      );
+
+      // Clear activePlan from state after dispatching
+      state.activePlan = null;
+      await writeState(ctx.cwd, state);
     },
   });
 }
