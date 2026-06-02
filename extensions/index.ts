@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { ApprovalComponent } from "./approval-component.js";
+import type { ApprovalAction } from "./approval-component.js";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -186,6 +189,34 @@ function countSteps(content: string): number {
 export default function (pi: ExtensionAPI) {
   let planMode = false;
   let activeStep: ActiveStep | null = null;
+  let proposedCommitMessage: string | null = null;
+
+  // ── finish_step tool — agent calls this when done with a step ──────────────
+  pi.registerTool({
+    name: "finish_step",
+    label: "Finish Step",
+    description:
+      "Call this when you have finished implementing the current step. " +
+      "Write a conventional commit message summarising exactly what you changed.",
+    parameters: Type.Object({
+      commitMessage: Type.String({
+        description:
+          "A conventional commit message for the changes made in this step (e.g. 'feat: add login form validation').",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      proposedCommitMessage = params.commitMessage;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Commit message recorded: "${params.commitMessage}". Stop here — do not call any more tools.`,
+          },
+        ],
+        details: undefined,
+      };
+    },
+  });
 
   // ── Block destructive tools in plan mode ────────────────────────────────────
   pi.on("tool_call", (event, ctx) => {
@@ -334,13 +365,55 @@ export default function (pi: ExtensionAPI) {
     const state = await readState(ctx.cwd);
     const planPath = state.activePlan;
 
-    const approved = await ctx.ui.confirm(
-      `✅ Step ${step.number} complete?`,
-      `Approve "${step.title}" to commit and advance.`,
+    // Collect diff --stat output (staged + unstaged vs HEAD)
+    const { stdout: diffStat } = await pi.exec("git", ["diff", "--stat", "HEAD"]);
+
+    // Lines with " | " are file-change lines; the summary line doesn't have them
+    const fileChangeLines = diffStat.split("\n").filter((l) => / \| /.test(l));
+
+    const MAX_DISPLAY = 10;
+    const commitMsg = proposedCommitMessage ?? `Step ${step.number}: ${step.title}`;
+
+    // Header line shows the proposed commit message; diff lines follow
+    const displayLines: string[] = [
+      `Commit: ${commitMsg}`,
+      "",
+      ...(fileChangeLines.length <= MAX_DISPLAY
+        ? fileChangeLines
+        : [
+            ...fileChangeLines.slice(0, MAX_DISPLAY),
+            `  ...and ${fileChangeLines.length - MAX_DISPLAY} more files`,
+          ]),
+    ];
+
+    if (fileChangeLines.length === 0) {
+      displayLines.push("(no changes detected)");
+    }
+
+    // Show ApprovalComponent via ctx.ui.custom overlay
+    const action = await ctx.ui.custom<ApprovalAction | null>(
+      (tui, theme, _kb, done) => {
+        const component = new ApprovalComponent(
+          displayLines,
+          done,
+          { fg: (c, t) => theme.fg(c as ThemeColor, t), bold: (t) => theme.bold(t) },
+          () => tui.requestRender(),
+        );
+        return {
+          render: (w: number) => component.render(w),
+          invalidate: () => component.invalidate(),
+          handleInput: (data: string) => component.handleInput(data),
+        };
+      },
+      { overlay: true },
     );
 
-    if (!approved) {
+    if (!action) return;
+
+    // ── Reject ────────────────────────────────────────────────────────────────
+    if (action === "reject") {
       activeStep = null;
+      proposedCommitMessage = null;
       ctx.ui.notify(
         `Step ${step.number} rejected. Provide feedback and re-run /next-step when ready.`,
         "warning",
@@ -348,18 +421,25 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Commit work
+    // ── Tweak ─────────────────────────────────────────────────────────────────
+    if (action === "tweak") {
+      proposedCommitMessage = null; // agent will call finish_step again after the tweak
+      const feedback = await ctx.ui.input("What do you want to change?");
+      if (feedback) {
+        pi.sendUserMessage(feedback, { deliverAs: "followUp" });
+      }
+      // Keep activeStep set — gate re-arms on next agent_end
+      return;
+    }
+
+    // ── Approve ───────────────────────────────────────────────────────────────
     await pi.exec("git", ["add", "-A"]);
-    const { code, stderr } = await pi.exec("git", [
-      "commit",
-      "-m",
-      `Step ${step.number}: ${step.title}`,
-    ]);
+    const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
 
     if (code !== 0 && !stderr.includes("nothing to commit")) {
       ctx.ui.notify(`git commit failed: ${stderr}`, "error");
     } else {
-      ctx.ui.notify(`Committed: Step ${step.number} — ${step.title}`, "info");
+      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
     }
 
     // Update state: mark step completed and advance currentStep
@@ -372,8 +452,9 @@ export default function (pi: ExtensionAPI) {
       await writeState(ctx.cwd, state);
     }
 
-    // Clear active step, then queue /auto-advance
+    // Clear state and queue /auto-advance
     activeStep = null;
+    proposedCommitMessage = null;
     pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
   });
 
@@ -421,7 +502,9 @@ export default function (pi: ExtensionAPI) {
         `## Your task\n\n` +
         `Implement **Step ${step.number} — ${step.title}**.\n\n` +
         `Step content:\n\n${step.body}\n\n` +
-        `When done, stop — do not proceed to any other steps.`;
+        `When you have finished implementing the step, call the \`finish_step\` tool with a ` +
+        `conventional commit message describing exactly what you changed. ` +
+        `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
 
       pi.sendUserMessage(message, { deliverAs: "followUp" });
     },
