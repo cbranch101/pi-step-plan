@@ -190,6 +190,7 @@ export default function (pi: ExtensionAPI) {
   let planMode = false;
   let activeStep: ActiveStep | null = null;
   let proposedCommitMessage: string | null = null;
+  let planClosePath: string | null = null; // set while agent is doing plan-close work
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
   pi.registerTool({
@@ -359,6 +360,32 @@ export default function (pi: ExtensionAPI) {
 
   // ── Approval gate on agent_end ──────────────────────────────────────────────
   pi.on("agent_end", async (_event, ctx) => {
+    // ── plan-close commit flow ────────────────────────────────────────────────
+    if (planClosePath) {
+      const closingPath = planClosePath;
+      planClosePath = null;
+
+      const planName = closingPath.split("/").pop()?.replace(/\.md$/, "") ?? closingPath;
+      const commitMsg = `plan-close: ${planName}`;
+
+      await pi.exec("git", ["add", "-A"]);
+      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
+
+      if (code !== 0 && !stderr.includes("nothing to commit")) {
+        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
+      } else {
+        ctx.ui.notify(`Committed: ${commitMsg}`, "info");
+      }
+
+      // Clear activePlan from state now that everything is committed
+      const state = await readState(ctx.cwd);
+      state.activePlan = null;
+      await writeState(ctx.cwd, state);
+
+      ctx.ui.notify(`✅ Plan closed. State cleared.`, "info");
+      return;
+    }
+
     if (!activeStep || !ctx.hasUI) return;
 
     const step = activeStep;
@@ -549,20 +576,22 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Closing plan: ${planPath}`, "info");
 
+      // Set flag so agent_end will commit and clear state after agent finishes
+      planClosePath = planPath;
+
+      const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
+
       pi.sendUserMessage(
         `The active plan has been completed. Please do the following:\n\n` +
           `1. Review the full plan below and the current conversation thread.\n` +
           `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
           `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
-          `3. Make those updates now.\n` +
-          `4. After all updates, run: \`git add -A && git commit -m "plan-close: ${planPath}"\`\n\n` +
+          `3. Make those updates now using the write and edit tools.\n` +
+          `4. Do NOT run git — the extension will commit everything automatically when you finish.\n\n` +
+          `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
       );
-
-      // Clear activePlan from state after dispatching
-      state.activePlan = null;
-      await writeState(ctx.cwd, state);
     },
   });
 }
