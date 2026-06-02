@@ -24,7 +24,6 @@ CORE PRINCIPLES
 STRUCTURAL RULES
 - This meta block must remain in all versions of the doc.
 - Append new Steps to the end; do not renumber completed ones.
-- Each Step must map to one checklist item.
 - Remove placeholder comments after first population.
 - For interfaces, dependencies, or workflows that are unchanged, simply mark "Unchanged."
 
@@ -105,8 +104,8 @@ END AI_DOC_META_GUIDANCE
 2) [Reference affected file(s) or function(s)]
 
 **Verify**
-- [ ] [Behavioral outcome]
-- [ ] [Integration validation]
+- [Behavioral outcome]
+- [Integration validation]
 
 ---
 
@@ -188,9 +187,6 @@ function countSteps(content: string): number {
 
 export default function (pi: ExtensionAPI) {
   let planMode = false;
-  let activeStep: ActiveStep | null = null;
-  let proposedCommitMessage: string | null = null;
-  let planClosePath: string | null = null; // set while agent is doing plan-close work
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
   pi.registerTool({
@@ -205,15 +201,99 @@ export default function (pi: ExtensionAPI) {
           "A conventional commit message for the changes made in this step (e.g. 'feat: add login form validation').",
       }),
     }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
-      proposedCommitMessage = params.commitMessage;
-      return {
-        content: [
-          {
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+      const commitMsg = params.commitMessage;
+
+      // Collect diff --stat output
+      const { stdout: diffStat } = await pi.exec("git", ["diff", "--stat", "HEAD"]);
+      const fileChangeLines = diffStat.split("\n").filter((l) => / \| /.test(l));
+      const MAX_DISPLAY = 10;
+
+      const displayLines: string[] = [
+        `Commit: ${commitMsg}`,
+        "",
+        ...(fileChangeLines.length <= MAX_DISPLAY
+          ? fileChangeLines
+          : [
+              ...fileChangeLines.slice(0, MAX_DISPLAY),
+              `  ...and ${fileChangeLines.length - MAX_DISPLAY} more files`,
+            ]),
+      ];
+
+      if (fileChangeLines.length === 0) {
+        displayLines.push("(no changes detected)");
+      }
+
+      const action = await ctx.ui.custom<ApprovalAction | null>(
+        (tui, theme, _kb, done) => {
+          const component = new ApprovalComponent(
+            displayLines,
+            done,
+            { fg: (c, t) => theme.fg(c as ThemeColor, t), bold: (t) => theme.bold(t) },
+            () => tui.requestRender(),
+          );
+          return {
+            render: (w: number) => component.render(w),
+            invalidate: () => component.invalidate(),
+            handleInput: (data: string) => component.handleInput(data),
+          };
+        },
+        { overlay: true },
+      );
+
+      // ── Reject ────────────────────────────────────────────────────────────
+      if (!action || action === "reject") {
+        return {
+          content: [{ type: "text", text: "Step rejected by user. Stop and wait for further instructions." }],
+          details: undefined,
+        };
+      }
+
+      // ── Tweak ─────────────────────────────────────────────────────────────
+      if (action === "tweak") {
+        const feedback = await ctx.ui.input("What do you want to change?");
+        return {
+          content: [{
             type: "text",
-            text: `Commit message recorded: "${params.commitMessage}". Stop here — do not call any more tools.`,
-          },
-        ],
+            text: feedback
+              ? `User feedback: ${feedback}. Please make the requested changes and call finish_step again when done.`
+              : "User requested changes. Please review your work and call finish_step again when done.",
+          }],
+          details: undefined,
+        };
+      }
+
+      // ── Approve ───────────────────────────────────────────────────────────
+      await pi.exec("git", ["add", "-A"]);
+      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
+
+      if (code !== 0 && !stderr.includes("nothing to commit")) {
+        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
+        return {
+          content: [{ type: "text", text: `Git commit failed: ${stderr}. Do not proceed.` }],
+          details: undefined,
+        };
+      }
+
+      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
+
+      // Update state
+      if (planPath && state.plans[planPath]) {
+        const progress = state.plans[planPath];
+        const stepNumber = progress.currentStep;
+        if (!progress.completedSteps.includes(stepNumber)) {
+          progress.completedSteps.push(stepNumber);
+        }
+        progress.currentStep = stepNumber + 1;
+        await writeState(ctx.cwd, state);
+      }
+
+      pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
+
+      return {
+        content: [{ type: "text", text: `Step committed successfully: "${commitMsg}". Auto-advancing to next step.` }],
         details: undefined,
       };
     },
@@ -294,9 +374,10 @@ export default function (pi: ExtensionAPI) {
           `1. Review our full conversation above and extract all decisions, goals, constraints, ` +
           `architecture choices, and action items.\n` +
           `2. Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign").\n` +
-          `3. Write a populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. ` +
-          `Fill in every section from our conversation — do not leave placeholders.\n` +
-          `4. After writing the file, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
+          `3. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
+          `4. Ask the user if they have any feedback or changes to the file.\n` +
+          `5. Incorporate any feedback by editing the file, repeating step 4 until the user is satisfied.\n` +
+          `6. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
@@ -358,133 +439,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Approval gate on agent_end ──────────────────────────────────────────────
-  pi.on("agent_end", async (_event, ctx) => {
-    // ── plan-close commit flow ────────────────────────────────────────────────
-    if (planClosePath) {
-      const closingPath = planClosePath;
-      planClosePath = null;
-
-      const planName = closingPath.split("/").pop()?.replace(/\.md$/, "") ?? closingPath;
-      const commitMsg = `plan-close: ${planName}`;
-
-      await pi.exec("git", ["add", "-A"]);
-      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
-
-      if (code !== 0 && !stderr.includes("nothing to commit")) {
-        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
-      } else {
-        ctx.ui.notify(`Committed: ${commitMsg}`, "info");
-      }
-
-      // Clear activePlan from state now that everything is committed
-      const state = await readState(ctx.cwd);
-      state.activePlan = null;
-      await writeState(ctx.cwd, state);
-
-      ctx.ui.notify(`✅ Plan closed. State cleared.`, "info");
-      return;
-    }
-
-    if (!activeStep || !ctx.hasUI) return;
-
-    const step = activeStep;
-    const state = await readState(ctx.cwd);
-    const planPath = state.activePlan;
-
-    // Collect diff --stat output (staged + unstaged vs HEAD)
-    const { stdout: diffStat } = await pi.exec("git", ["diff", "--stat", "HEAD"]);
-
-    // Lines with " | " are file-change lines; the summary line doesn't have them
-    const fileChangeLines = diffStat.split("\n").filter((l) => / \| /.test(l));
-
-    const MAX_DISPLAY = 10;
-    const commitMsg = proposedCommitMessage ?? `Step ${step.number}: ${step.title}`;
-
-    // Header line shows the proposed commit message; diff lines follow
-    const displayLines: string[] = [
-      `Commit: ${commitMsg}`,
-      "",
-      ...(fileChangeLines.length <= MAX_DISPLAY
-        ? fileChangeLines
-        : [
-            ...fileChangeLines.slice(0, MAX_DISPLAY),
-            `  ...and ${fileChangeLines.length - MAX_DISPLAY} more files`,
-          ]),
-    ];
-
-    if (fileChangeLines.length === 0) {
-      displayLines.push("(no changes detected)");
-    }
-
-    // Show ApprovalComponent via ctx.ui.custom overlay
-    const action = await ctx.ui.custom<ApprovalAction | null>(
-      (tui, theme, _kb, done) => {
-        const component = new ApprovalComponent(
-          displayLines,
-          done,
-          { fg: (c, t) => theme.fg(c as ThemeColor, t), bold: (t) => theme.bold(t) },
-          () => tui.requestRender(),
-        );
-        return {
-          render: (w: number) => component.render(w),
-          invalidate: () => component.invalidate(),
-          handleInput: (data: string) => component.handleInput(data),
-        };
-      },
-      { overlay: true },
-    );
-
-    if (!action) return;
-
-    // ── Reject ────────────────────────────────────────────────────────────────
-    if (action === "reject") {
-      activeStep = null;
-      proposedCommitMessage = null;
-      ctx.ui.notify(
-        `Step ${step.number} rejected. Provide feedback and re-run /next-step when ready.`,
-        "warning",
-      );
-      return;
-    }
-
-    // ── Tweak ─────────────────────────────────────────────────────────────────
-    if (action === "tweak") {
-      proposedCommitMessage = null; // agent will call finish_step again after the tweak
-      const feedback = await ctx.ui.input("What do you want to change?");
-      if (feedback) {
-        pi.sendUserMessage(feedback, { deliverAs: "followUp" });
-      }
-      // Keep activeStep set — gate re-arms on next agent_end
-      return;
-    }
-
-    // ── Approve ───────────────────────────────────────────────────────────────
-    await pi.exec("git", ["add", "-A"]);
-    const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
-
-    if (code !== 0 && !stderr.includes("nothing to commit")) {
-      ctx.ui.notify(`git commit failed: ${stderr}`, "error");
-    } else {
-      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
-    }
-
-    // Update state: mark step completed and advance currentStep
-    if (planPath && state.plans[planPath]) {
-      const progress = state.plans[planPath];
-      if (!progress.completedSteps.includes(step.number)) {
-        progress.completedSteps.push(step.number);
-      }
-      progress.currentStep = step.number + 1;
-      await writeState(ctx.cwd, state);
-    }
-
-    // Clear state and queue /auto-advance
-    activeStep = null;
-    proposedCommitMessage = null;
-    pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
-  });
-
   // ── /next-step ───────────────────────────────────────────────────────────────
   pi.registerCommand("next-step", {
     description: "Dispatch the current step from the active plan to the agent",
@@ -521,7 +475,6 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      activeStep = step;
       ctx.ui.notify(`Dispatching Step ${step.number}: ${step.title}`, "info");
 
       const message =
@@ -576,10 +529,8 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Closing plan: ${planPath}`, "info");
 
-      // Set flag so agent_end will commit and clear state after agent finishes
-      planClosePath = planPath;
-
       const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
+      const commitMsg = `plan-close: ${planName}`;
 
       pi.sendUserMessage(
         `The active plan has been completed. Please do the following:\n\n` +
@@ -587,11 +538,17 @@ export default function (pi: ExtensionAPI) {
           `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
           `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
           `3. Make those updates now using the write and edit tools.\n` +
-          `4. Do NOT run git — the extension will commit everything automatically when you finish.\n\n` +
+          `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
+          `5. After committing, your work here is complete.\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
       );
+
+      // Clear activePlan from state
+      const updatedState = await readState(ctx.cwd);
+      updatedState.activePlan = null;
+      await writeState(ctx.cwd, updatedState);
     },
   });
 }
