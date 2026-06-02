@@ -240,7 +240,7 @@ export default function (pi: ExtensionAPI) {
             handleInput: (data: string) => component.handleInput(data),
           };
         },
-        { overlay: true },
+        { overlay: false },
       );
 
       // ── Reject ────────────────────────────────────────────────────────────
