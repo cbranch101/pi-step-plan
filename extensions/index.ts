@@ -187,6 +187,7 @@ function countSteps(content: string): number {
 
 export default function (pi: ExtensionAPI) {
   let planMode = false;
+  let proposedCommitMessage: string | null = null;
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
   pi.registerTool({
@@ -201,102 +202,94 @@ export default function (pi: ExtensionAPI) {
           "A conventional commit message for the changes made in this step (e.g. 'feat: add login form validation').",
       }),
     }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
-      const commitMsg = params.commitMessage;
-
-      // Collect diff --stat output
-      const { stdout: diffStat } = await pi.exec("git", ["diff", "--stat", "HEAD"]);
-      const fileChangeLines = diffStat.split("\n").filter((l) => / \| /.test(l));
-      const MAX_DISPLAY = 10;
-
-      const displayLines: string[] = [
-        `Commit: ${commitMsg}`,
-        "",
-        ...(fileChangeLines.length <= MAX_DISPLAY
-          ? fileChangeLines
-          : [
-              ...fileChangeLines.slice(0, MAX_DISPLAY),
-              `  ...and ${fileChangeLines.length - MAX_DISPLAY} more files`,
-            ]),
-      ];
-
-      if (fileChangeLines.length === 0) {
-        displayLines.push("(no changes detected)");
-      }
-
-      const action = await ctx.ui.custom<ApprovalAction | null>(
-        (tui, theme, _kb, done) => {
-          const component = new ApprovalComponent(
-            displayLines,
-            done,
-            { fg: (c, t) => theme.fg(c as ThemeColor, t), bold: (t) => theme.bold(t) },
-            () => tui.requestRender(),
-          );
-          return {
-            render: (w: number) => component.render(w),
-            invalidate: () => component.invalidate(),
-            handleInput: (data: string) => component.handleInput(data),
-          };
-        },
-        { overlay: true },
-      );
-
-      // ── Reject ────────────────────────────────────────────────────────────
-      if (!action || action === "reject") {
-        return {
-          content: [{ type: "text", text: "Step rejected by user. Stop and wait for further instructions." }],
-          details: undefined,
-        };
-      }
-
-      // ── Tweak ─────────────────────────────────────────────────────────────
-      if (action === "tweak") {
-        const feedback = await ctx.ui.input("What do you want to change?");
-        return {
-          content: [{
-            type: "text",
-            text: feedback
-              ? `User feedback: ${feedback}. Please make the requested changes and call finish_step again when done.`
-              : "User requested changes. Please review your work and call finish_step again when done.",
-          }],
-          details: undefined,
-        };
-      }
-
-      // ── Approve ───────────────────────────────────────────────────────────
-      await pi.exec("git", ["add", "-A"]);
-      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
-
-      if (code !== 0 && !stderr.includes("nothing to commit")) {
-        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
-        return {
-          content: [{ type: "text", text: `Git commit failed: ${stderr}. Do not proceed.` }],
-          details: undefined,
-        };
-      }
-
-      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
-
-      // Update state
-      if (planPath && state.plans[planPath]) {
-        const progress = state.plans[planPath];
-        const stepNumber = progress.currentStep;
-        if (!progress.completedSteps.includes(stepNumber)) {
-          progress.completedSteps.push(stepNumber);
-        }
-        progress.currentStep = stepNumber + 1;
-        await writeState(ctx.cwd, state);
-      }
-
-      pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
-
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      proposedCommitMessage = params.commitMessage;
       return {
-        content: [{ type: "text", text: `Step committed successfully: "${commitMsg}". Auto-advancing to next step.` }],
+        content: [{ type: "text", text: `Commit message recorded. Stop here — do not call any more tools.` }],
         details: undefined,
       };
     },
+  });
+
+  // ── Approval gate on agent_end ──────────────────────────────────────────────
+  pi.on("agent_end", async (_event, ctx) => {
+    // ── step approval flow ────────────────────────────────────────────────────
+    if (!proposedCommitMessage) return;
+
+    const commitMsg = proposedCommitMessage;
+    proposedCommitMessage = null;
+
+    const state = await readState(ctx.cwd);
+    const planPath = state.activePlan;
+    const stepNumber = planPath ? (state.plans[planPath]?.currentStep ?? null) : null;
+
+    const { stdout: diffStat } = await pi.exec("git", ["diff", "--stat", "HEAD"]);
+    const fileChangeLines = diffStat.split("\n").filter((l) => / \| /.test(l));
+    const MAX_DISPLAY = 10;
+
+    const displayLines: string[] = [
+      `Commit: ${commitMsg}`,
+      "",
+      ...(fileChangeLines.length <= MAX_DISPLAY
+        ? fileChangeLines
+        : [
+            ...fileChangeLines.slice(0, MAX_DISPLAY),
+            `  ...and ${fileChangeLines.length - MAX_DISPLAY} more files`,
+          ]),
+    ];
+    if (fileChangeLines.length === 0) displayLines.push("(no changes detected)");
+
+    const action = await ctx.ui.custom<ApprovalAction | null>(
+      (tui, theme, _kb, done) => {
+        const component = new ApprovalComponent(
+          displayLines,
+          done,
+          { fg: (c, t) => theme.fg(c as ThemeColor, t), bold: (t) => theme.bold(t) },
+          () => tui.requestRender(),
+        );
+        return {
+          render: (w: number) => component.render(w),
+          invalidate: () => component.invalidate(),
+          handleInput: (data: string) => component.handleInput(data),
+        };
+      },
+      { overlay: true },
+    );
+
+    if (!action || action === "reject") {
+      ctx.ui.notify(`Step rejected. Provide feedback and re-run /next-step when ready.`, "warning");
+      return;
+    }
+
+    if (action === "tweak") {
+      const feedback = await ctx.ui.input("What do you want to change?");
+      if (feedback) pi.sendUserMessage(feedback, { deliverAs: "followUp" });
+      // Re-arm: restore commit message so gate fires again on next agent_end
+      proposedCommitMessage = commitMsg;
+      return;
+    }
+
+    // ── Approve ───────────────────────────────────────────────────────────────
+    await pi.exec("git", ["add", "-A"]);
+    const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
+
+    if (code !== 0 && !stderr.includes("nothing to commit")) {
+      ctx.ui.notify(`git commit failed: ${stderr}`, "error");
+      return;
+    }
+
+    ctx.ui.notify(`Committed: ${commitMsg}`, "info");
+
+    if (planPath && state.plans[planPath] && stepNumber !== null) {
+      const progress = state.plans[planPath];
+      if (!progress.completedSteps.includes(stepNumber)) {
+        progress.completedSteps.push(stepNumber);
+      }
+      progress.currentStep = stepNumber + 1;
+      await writeState(ctx.cwd, state);
+    }
+
+    pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
   });
 
   // ── Block destructive tools in plan mode ────────────────────────────────────
