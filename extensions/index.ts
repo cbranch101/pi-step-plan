@@ -223,7 +223,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event, ctx) => {
     if (!planMode) return;
 
-    if (["bash", "write", "edit"].includes(event.toolName)) {
+    if (["write", "edit"].includes(event.toolName)) {
       ctx.ui.notify(
         `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
         "warning",
@@ -231,7 +231,7 @@ export default function (pi: ExtensionAPI) {
       return {
         block: true,
         reason:
-          "Plan mode is active. bash, write, and edit are disabled during planning. " +
+          "Plan mode is active. write and edit are disabled during planning. " +
           "Discuss and plan only — no implementation. Run /plan-finish when done.",
       };
     }
@@ -249,7 +249,7 @@ export default function (pi: ExtensionAPI) {
         `ask clarifying questions, and discuss the approach.\n` +
         `\n` +
         `**You must NOT:**\n` +
-        `- Call bash, write, or edit under any circumstances\n` +
+        `- Call write or edit under any circumstances\n` +
         `- Start implementing anything\n` +
         `- Write code in responses unless it is illustrative pseudocode\n` +
         `\n` +
@@ -264,11 +264,11 @@ export default function (pi: ExtensionAPI) {
 
   // ── /plan-start ─────────────────────────────────────────────────────────────
   pi.registerCommand("plan-start", {
-    description: "Enter planning mode — discussion only, no file writes or bash execution",
+    description: "Enter planning mode — discussion only, no file writes",
     handler: (_args, ctx) => {
       planMode = true;
       ctx.ui.notify(
-        "⏸ Plan mode enabled. bash, write, and edit are blocked.\n" +
+        "⏸ Plan mode enabled. write and edit are blocked.\n" +
           "Discuss and plan freely. Run /plan-finish when ready to generate the plan doc.",
         "info",
       );
