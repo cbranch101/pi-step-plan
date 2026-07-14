@@ -120,6 +120,7 @@ END AI_DOC_META_GUIDANCE
 interface PlanProgress {
   currentStep: number;
   completedSteps: number[];
+  githubIssues: number[];
 }
 
 interface PlanState {
@@ -346,6 +347,123 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── create_github_issues tool — agent calls this after /plan-finish commit ──
+  pi.registerTool({
+    name: "create_github_issues",
+    label: "Create GitHub Issues",
+    description:
+      "Call this after the plan doc has been committed during /plan-finish. " +
+      "Submit drafted GitHub issues for user review; the extension will handle confirmation and creation via gh. " +
+      "Do NOT run gh commands directly. If the tool returns feedback for any issue, revise that issue and call this tool again.",
+    parameters: Type.Object({
+      issues: Type.Array(
+        Type.Object({
+          title: Type.String({ description: "Issue title" }),
+          body: Type.String({ description: "Issue body describing the problem being solved" }),
+        }),
+        { description: "Draft issues to present for user review" },
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+
+      if (!planPath || !state.plans[planPath]) {
+        return {
+          content: [{ type: "text", text: "No active plan found in state. Cannot create GitHub issues." }],
+          details: undefined,
+        };
+      }
+
+      const createdNumbers: number[] = [];
+      const feedbackItems: string[] = [];
+
+      for (const issue of params.issues) {
+        const confirmed = await ctx.ui.confirm(
+          `Create this issue: "${issue.title}"?`,
+          issue.body,
+        );
+
+        if (confirmed) {
+          let ghOutput: string;
+          try {
+            const { code, stdout, stderr } = await pi.exec("gh", [
+              "issue", "create",
+              "--title", issue.title,
+              "--body", issue.body,
+            ]);
+            if (code !== 0) {
+              ctx.ui.notify(`gh issue create failed: ${stderr}`, "error");
+              return {
+                content: [{ type: "text", text: `gh issue create failed: ${stderr}. Do not proceed with remaining issues.` }],
+                details: undefined,
+              };
+            }
+            ghOutput = stdout.trim();
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.ui.notify(`gh not available: ${msg}`, "error");
+            return {
+              content: [{ type: "text", text: `gh is not installed or not authenticated: ${msg}. Cannot create issues.` }],
+              details: undefined,
+            };
+          }
+
+          // Parse issue number from URL (e.g. https://github.com/owner/repo/issues/42)
+          const urlMatch = ghOutput.match(/\/issues\/(\d+)/);
+          if (urlMatch) {
+            const issueNumber = parseInt(urlMatch[1]!, 10);
+            createdNumbers.push(issueNumber);
+            ctx.ui.notify(`Created issue #${issueNumber}: ${issue.title}`, "info");
+          } else {
+            ctx.ui.notify(`Issue created but could not parse number from: ${ghOutput}`, "warning");
+          }
+        } else {
+          const feedback = await ctx.ui.input(`Any feedback on "${issue.title}"? (leave blank to skip)`);
+          if (feedback?.trim()) {
+            feedbackItems.push(`- "${issue.title}": ${feedback.trim()}`);
+          }
+        }
+      }
+
+      // Persist created issue numbers into state
+      const freshState = await readState(ctx.cwd);
+      if (freshState.activePlan && freshState.plans[freshState.activePlan]) {
+        const progress = freshState.plans[freshState.activePlan];
+        if (!progress.githubIssues) progress.githubIssues = [];
+        for (const n of createdNumbers) {
+          if (!progress.githubIssues.includes(n)) {
+            progress.githubIssues.push(n);
+          }
+        }
+        await writeState(ctx.cwd, freshState);
+      }
+
+      const createdSummary =
+        createdNumbers.length > 0
+          ? `Created ${createdNumbers.length} issue(s): ${createdNumbers.map((n) => `#${n}`).join(", ")}.`
+          : "No issues were created.";
+
+      if (feedbackItems.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text:
+              `${createdSummary}\n\n` +
+              `The following issues were declined with feedback — please revise them and call create_github_issues again:\n` +
+              feedbackItems.join("\n"),
+          }],
+          details: undefined,
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: createdSummary }],
+        details: undefined,
+      };
+    },
+  });
+
   // ── Block destructive tools in plan mode ────────────────────────────────────
   pi.on("tool_call", (event, ctx) => {
     if (!planMode) return;
@@ -449,7 +567,12 @@ export default function (pi: ExtensionAPI) {
           `3. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
           `4. Ask the user if they have any feedback or changes to the file.\n` +
           `5. Incorporate any feedback by editing the file, repeating step 4 until the user is satisfied.\n` +
-          `6. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
+          `6. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
+          `7. After committing, re-read the committed plan file and draft one or more GitHub issues ` +
+          `that represent the *problems being solved* by this plan — not a summary of the plan itself. ` +
+          `Each issue should be framed as a problem statement a developer could act on independently.\n` +
+          `8. Call the \`create_github_issues\` tool with the drafted issues. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
@@ -592,7 +715,7 @@ export default function (pi: ExtensionAPI) {
 
       // Initialize state for this plan if not already tracked
       if (!state.plans[planPath]) {
-        state.plans[planPath] = { currentStep: 1, completedSteps: [] };
+        state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [] };
       }
       state.activePlan = planPath;
       await writeState(ctx.cwd, state);
