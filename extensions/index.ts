@@ -375,6 +375,70 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── review_issue_outline tool — agent calls this before create_github_issues ──
+  pi.registerTool({
+    name: "review_issue_outline",
+    label: "Review Issue Outline",
+    description:
+      "Call this after the plan doc has been committed, BEFORE drafting full issue bodies. " +
+      "Submit a list of proposed issue titles and one-sentence summaries so the user can approve the shape and granularity of the tickets. " +
+      "If the user requests changes, revise the outline and call this tool again. " +
+      "Only call create_github_issues once this tool returns an approved result.",
+    parameters: Type.Object({
+      issues: Type.Array(
+        Type.Object({
+          title: Type.String({ description: "Issue title" }),
+          summary: Type.String({
+            description: "One-sentence description of the problem this issue addresses",
+          }),
+        }),
+        { description: "Proposed issue titles and summaries for granularity review" },
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const outlineText = params.issues
+        .map((issue, i) => `${i + 1}. ${issue.title}\n   ${issue.summary}`)
+        .join("\n\n");
+
+      const confirmed = await ctx.ui.confirm(
+        `Approve this issue outline? (${params.issues.length} issue${params.issues.length !== 1 ? "s" : ""})`,
+        outlineText,
+      );
+
+      if (confirmed) {
+        const approvedList = params.issues
+          .map((issue, i) => `${i + 1}. ${issue.title} — ${issue.summary}`)
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Outline approved by user. Now expand each item into a full issue body and call create_github_issues with the complete bodies.\n\n` +
+                `Approved outline:\n${approvedList}`,
+            },
+          ],
+          details: undefined,
+        };
+      }
+
+      const feedback = await ctx.ui.input(
+        "What changes would you like to the issue outline? (leave blank to cancel)",
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: feedback?.trim()
+              ? `User requested changes to the outline: ${feedback.trim()}. Revise the outline and call review_issue_outline again. Do not call create_github_issues yet.`
+              : "User declined the outline without feedback. Revise and call review_issue_outline again.",
+          },
+        ],
+        details: undefined,
+      };
+    },
+  });
+
   // ── create_github_issues tool — agent calls this after /plan-finish commit ──
   pi.registerTool({
     name: "create_github_issues",
@@ -699,10 +763,13 @@ export default function (pi: ExtensionAPI) {
           `4. Ask the user if they have any feedback or changes to the file.\n` +
           `5. Incorporate any feedback by editing the file, repeating step 4 until the user is satisfied.\n` +
           `6. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `7. After committing, re-read the committed plan file and draft one or more GitHub issues ` +
-          `that represent the *problems being solved* by this plan — not a summary of the plan itself. ` +
-          `Each issue should be framed as a problem statement a developer could act on independently.\n` +
-          `8. Call the \`create_github_issues\` tool with the drafted issues. ` +
+          `7. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
+          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
+          `8. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `If the user requests changes, revise the outline and call the tool again. ` +
+          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
+          `9. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
@@ -1049,10 +1116,13 @@ export default function (pi: ExtensionAPI) {
           `2. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
           `3. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
           `4. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n` +
-          `5. After committing, re-read the committed plan file and draft one or more GitHub issues ` +
-          `that represent the *problems being solved* by this plan — not a summary of the plan itself. ` +
-          `Each issue should be framed as a problem statement a developer could act on independently.\n` +
-          `6. Call the \`create_github_issues\` tool with the drafted issues. ` +
+          `5. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
+          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
+          `6. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `If the user requests changes, revise the outline and call the tool again. ` +
+          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
+          `7. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `## Plan file: ${planPath}\n\n` +
           `## Plan content\n\n${planContent}`,

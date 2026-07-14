@@ -197,8 +197,13 @@ Three gaps exist in the current pi-step-plan workflow: completed plans accumulat
 **New tools:**
 
 ```
-create_github_issues    — agent submits drafted issues for user approval then gh creation
+review_issue_outline    — agent submits title+summary list; user iterates on shape before full bodies are written
+  input: { issues: Array<{ title: string; summary: string }> }
+  output: approved issues list (agent uses it to draft full bodies before calling create_github_issues)
+
+create_github_issues    — agent submits fully drafted issues for per-issue approval then gh creation
   input: { issues: Array<{ title: string; body: string }> }
+  must only be called after review_issue_outline has been approved
 
 create_pull_request     — agent submits drafted PR title/body for user approval then gh creation
   input: { title: string; body: string }
@@ -359,6 +364,27 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 
 - `planMode` does not need to be set — `/plan-adopt` is not a planning session, it's an adoption handoff. The write/edit block does not apply.
 - Keep `/plan-finish` unchanged; this command is purely additive.
+
+---
+
+#### Step 7 — Add `review_issue_outline` tool and wire it before `create_github_issues`
+
+**Recipe**
+
+1. Register a `review_issue_outline` tool in `extensions/index.ts` with input schema `{ issues: Array<{ title: string; summary: string }> }`. The handler renders all titles and one-line summaries together in a single display block, then collects free-form feedback via `ctx.ui` (approve / request changes). If the user requests changes, send the feedback back to the agent as a tool result asking it to redraft the outline and call the tool again; repeat until the user approves. Return the final approved list as the tool result so the agent can use it as input for `create_github_issues`.
+2. Update the `/plan-finish` agent prompt added in Step 2 to call `review_issue_outline` first with titles and one-line summaries, wait for approval, then expand each approved item into a full issue body and call `create_github_issues`. Add an explicit instruction: do not call `create_github_issues` until `review_issue_outline` returns an approved result.
+3. Apply the same two-step sequence to the `/plan-adopt` agent prompt added in Step 6.
+
+**Verify**
+
+- [ ] After `/plan-finish`, the agent calls `review_issue_outline` before `create_github_issues` — the outline is displayed and iterated before any full body is drafted
+- [ ] Requesting changes in the outline UI causes the agent to redraft and re-present the outline without creating any issues
+- [ ] Once the outline is approved, the agent expands it and calls `create_github_issues` with full bodies for only the approved tickets
+
+**Notes**
+
+- The outline step is purely a granularity gate — no GitHub API calls happen until `create_github_issues` runs.
+- Step 2 remains the authoritative implementation of `create_github_issues`; this step only adds the upstream gate and updates the agent prompt ordering.
 
 ---
 
