@@ -224,6 +224,7 @@ export default function (pi: ExtensionAPI) {
 
   let planMode = false;
   let revisePlanPath: string | null = null; // non-null when entered via /revise-plan
+  let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
   pi.registerTool({
@@ -240,6 +241,19 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      // Guard: only callable when a step was explicitly dispatched via /next-step or /resume-step
+      if (activeStepNumber === null) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "finish_step was called outside of an active step dispatch. No /next-step or /resume-step has been run in this session. Do not commit or modify state — stop and wait for user instructions.",
+            },
+          ],
+          details: undefined,
+        };
+      }
+
       const commitMsg = params.commitMessage;
 
       // Collect diff --stat output
@@ -281,6 +295,7 @@ export default function (pi: ExtensionAPI) {
 
       // ── Reject ────────────────────────────────────────────────────────────
       if (!action || action === "reject") {
+        activeStepNumber = null;
         return {
           content: [
             {
@@ -346,6 +361,7 @@ export default function (pi: ExtensionAPI) {
       }
       progress.currentStep = stepNumber + 1;
       await writeState(ctx.cwd, state);
+      activeStepNumber = null;
 
       return {
         content: [
@@ -775,6 +791,8 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Resuming Step ${stepNumber}: ${step.title}`, "info");
 
+      activeStepNumber = step.number;
+
       const message =
         `## Updated Plan\n\n${planContent}\n\n---\n\n` +
         `${diffSection}\n\n---\n\n` +
@@ -875,6 +893,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(`Dispatching Step ${step.number}: ${step.title}`, "info");
+
+      activeStepNumber = step.number;
 
       const message =
         `## Plan\n\n${planContent}\n\n---\n\n` +
