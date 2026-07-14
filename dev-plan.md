@@ -144,90 +144,68 @@ Each Step = one atomic unit of work that produces a testable outcome.
 END AI_DOC_META_GUIDANCE
 -->
 
-# AI Planning Doc: pi-step-plan Extension
+# AI Planning Doc: GitHub Integration & Plan Lifecycle Cleanup
 
 ---
 
 ## Project Summary
 
-Agents in Pi tend to jump into implementation during planning conversations, requiring constant correction. This extension adds a structured plan-then-execute workflow to Pi via six commands: `/plan-start` (constrained discussion mode), `/plan-finish` (generates and commits plan doc to `docs/plans/`), `/activate-plan` (select a plan to work on, initializes state), `/next-step` (executes one step at a time with a custom approval/tweak/reject gate and auto-commit), `/auto-advance` (internal session handoff), and `/plan-close` (finalizes execution by updating relevant repo files and committing). The done condition is a globally installable Pi package that enforces this loop across any project.
+Three gaps exist in the current pi-step-plan workflow: completed plans accumulate in `/activate-plan`'s picker with no way to clear them out; there is no GitHub integration — plans produce local commits but no issues or pull requests; and the `finish_step` tool has two state-management bugs that can cause step desync after a reject. This phase adds a plan archival mechanism, GitHub issue/PR tooling gated behind user approval, and fixes to the `finish_step` approve path. The done condition is: completing a plan automatically archives it from the picker, creates reviewed GitHub issues, opens a reviewed PR that closes those issues on merge, and step state is always consistent after approve/reject/tweak cycles.
 
 ---
 
 ## Goals & Success Criteria
 
-- `/plan-start` prevents the agent from writing any files or running bash during a planning conversation
-- `/plan-finish` generates a populated plan doc from conversation history, writes it to `docs/plans/<name>.md`, and commits it
-- `/activate-plan` presents a select of available plans and initializes a state file tracking active plan and current step
-- `/next-step` reads state to find the current step, sends the full plan + step to the agent, and presents an approve/tweak/reject gate on completion
-- `/plan-close` reviews the completed plan and conversation, updates relevant repo files with captured decisions, and commits
-- The package is installable globally via local path and iterable with `/reload`
+- `/activate-plan` no longer shows plans that have been closed; they are moved to `docs/plans/reference/` on `/plan-close`
+- After `/plan-finish` commits the plan doc, the agent drafts one or more GitHub issues framed as problem statements, presents them for user review and iteration, then creates them via `gh` only after approval
+- Issue numbers created during `/plan-finish` are stored in state and automatically injected as `closes #N` in the PR body at `/plan-close` time
+- The agent drafts the PR title and body at `/plan-close`, presents it for user review and iteration, then opens it via `gh` only after approval
+- All `gh` failures (not installed, not authenticated, no remote) are caught and surface a clear error to the user rather than silently failing
+- `finish_step` approve path always re-reads state immediately before writing, so stale state can never be written back and a missing plan entry can never silently skip the `currentStep` increment
+- `finish_step` validates that it was called for the step currently tracked in state, preventing the agent from calling it spontaneously after a reject and corrupting step progress
 
 ---
 
 ## Relevant Files
 
-- `package.json` (add) — Pi package manifest
-- `extensions/index.ts` (add) — main extension implementing all commands
-- `extensions/approval-component.ts` (add) — custom TUI component for approve/tweak/reject gate
-- `docs/plans/` (add) — directory where generated plan markdown files live
-- `.pi/plan-state.json` (add) — runtime state file tracking active plan and per-plan progress
-- `dev-plan.md` (add) — this file
+- `extensions/index.ts` (modify) — archive logic in `/plan-close`, two new tools, extended agent prompts in `/plan-finish` and `/plan-close`
 
 ---
 
 ## Constraints
 
-- Extension must work as a globally installed Pi package via local path
-- No plan file path arguments at runtime — active plan is always read from state
-- `/plan-start` must hard-block `bash`, `write`, and `edit` tool calls — not just instruct the agent
-- Commits must be clean and atomic: one commit for the plan file, one per step, one for plan-close updates
-- Must support `/reload` for iteration without reinstall
-- Step completion is tracked in state only — no `☑`/`☐` markers written to plan markdown
+- `gh` CLI is the sole mechanism for issue and PR creation; the extension does not call the GitHub API directly
+- Issue drafting and PR drafting must go through a user-approval gate before any `gh` command runs — no silent creation
+- `closes #N` injection is always performed by the extension from stored state, never left to the agent to remember
+- The plan file move on `/plan-close` must succeed before state is updated; if rename fails, the command aborts with an error
+- Issue creation only happens after the plan doc commit; PR creation only happens after the `/plan-close` cleanup commit
 
 ---
 
 ## Architecture & Design
 
-- Two extension files: `index.ts` (commands + event handlers) and `approval-component.ts` (pure TUI component)
-- In-memory state tracks: `planMode: boolean`, `activeStep: { number, title } | null`
-- Persistent state in `.pi/plan-state.json`: active plan path + per-plan `{ currentStep, completedSteps[] }` keyed by plan file path
-- Plan files live in `docs/plans/<name>.md`; no check markers — state file is sole source of truth for progress
-- `tool_call` event handler blocks `bash`/`write`/`edit` when `planMode` is true
-- `agent_end` event handler shows `ApprovalComponent` when `activeStep` is set; tweak leaves `activeStep` set so the gate re-arms automatically on the next `agent_end`
-- On approval, `/auto-advance` is queued via `pi.sendUserMessage()` — `ctx.newSession()` is only available in command handlers, not event handlers
-- New session is pre-seeded with plan file content so `/next-step` has full context immediately
+- Two new tools registered: `create_github_issues` and `create_pull_request` — follow the `finish_step` pattern (agent calls tool → extension owns the approval gate and side effect)
+- `/plan-close` gains two new responsibilities: (1) `fs.rename` the plan file into `docs/plans/reference/`, (2) prompt the agent to call `create_pull_request` after its cleanup commit
+- `/plan-finish` gains one new responsibility: prompt the agent to call `create_github_issues` after its plan doc commit
+- State shape gains one new field per plan: `githubIssues: number[]` — populated when issues are created, read when the PR is opened
+- `docs/plans/reference/` is created at install time (or lazily on first `/plan-close`) with a `.gitkeep`
 
 ---
 
 ## Interfaces & Contracts
 
-**Commands registered:**
+**New tools:**
 
 ```
-/plan-start        — enters plan mode, augments system prompt, blocks destructive tools
-/plan-finish       — exits plan mode, agent generates plan doc, writes to docs/plans/<name>.md, commits
-/activate-plan     — select from docs/plans/*.md, write/update state file, set currentStep to 1
-/next-step         — read state for current step, send full plan + step to agent, arm approval gate
-/auto-advance      — internal; update state to next step, new session pre-seeded with plan, queue /next-step
-/plan-close        — review plan + thread, update relevant repo files, commit
+create_github_issues    — agent submits drafted issues for user approval then gh creation
+  input: { issues: Array<{ title: string; body: string }> }
+
+create_pull_request     — agent submits drafted PR title/body for user approval then gh creation
+  input: { title: string; body: string }
+  extension injects: "closes #N" for each stored issue number before showing to user
 ```
 
-**Plan file step format (read-only at runtime):**
-
-```markdown
-## Steps
-
-#### Step 1 — Some Title
-
-**Recipe**
-...
-
-**Verify**
-...
-```
-
-**State file shape (`.pi/plan-state.json`):**
+**Updated state shape (`.pi/plan-state.json`):**
 
 ```json
 {
@@ -235,184 +213,137 @@ Agents in Pi tend to jump into implementation during planning conversations, req
   "plans": {
     "docs/plans/auth-refactor.md": {
       "currentStep": 3,
-      "completedSteps": [1, 2]
-    },
-    "docs/plans/api-redesign.md": {
-      "currentStep": 1,
-      "completedSteps": []
+      "completedSteps": [1, 2],
+      "githubIssues": [42, 43]
     }
   }
 }
 ```
 
+**`/activate-plan` scan scope:** `docs/plans/*.md` only — `docs/plans/reference/` is never scanned. Unchanged.
+
 ---
 
 ## Dependencies
 
-- `@earendil-works/pi-coding-agent` — peer dependency, extension types
-- `typebox` — peer dependency, tool parameter schemas
+- `gh` CLI — runtime peer dependency; must be installed and authenticated in the target project environment; no npm package added
+- All other dependencies: Unchanged.
 
-**Outcome:** No runtime deps beyond Pi builtins; `peerDependencies` only.
+**Outcome:** No changes to `package.json`; `gh` is a runtime prerequisite documented in README.
 
 ---
 
 ## Risks / Unknowns
 
-- **Approval gate timing** — `agent_end` fires after all tool calls; `ctx.ui.custom()` must be available here and not race with Pi returning to idle → validate in Step 5
-- **Session handoff** — `ctx.newSession()` can only be called from command handlers; approval gate queues `/auto-advance` as a follow-up → verify no state leaks between steps
-- **Plan generation quality** — the `/plan-finish` prompt needs to reliably produce well-structured output from varied conversations → may need prompt tuning after first use
-- **State file corruption** — if a session is killed mid-step, `currentStep` may point to a step that was partially implemented → acceptable risk for now, user can manually edit state
+- **`gh` not available** — `pi.exec("gh", [...])` will throw; tool handlers must catch and surface a clear error rather than leaving the session in a broken state
+- **Partial issue approval** — user may approve 2 of 3 drafted issues; only approved+created issue numbers go into state; the PR body must reflect only what was actually created
+- **File rename across mounts** — `fs.rename` fails if source and destination are on different filesystems; mitigate by using a copy-then-delete fallback or catching the error and instructing the user
+- **Agent forgets to call tools** — the agent might attempt to run `gh` directly rather than calling the tool; mitigate via explicit instruction in the prompt ("do not run gh commands directly; call the tool")
 
 ---
 
 ## Decision Log
 
-- **2026-06-01** — Hard-block tools in plan mode rather than relying on system prompt instruction. Rationale: agents ignore instructions under pressure; hard blocking is the only reliable enforcement.
-- **2026-06-01** — State file (not markdown markers) tracks step completion. Rationale: keeps plan docs as clean, readable documents; supports switching between multiple active plans without corrupting markdown.
-- **2026-06-01** — Plans live in `docs/plans/` not root. Rationale: keeps repo root clean, makes plans discoverable by `/activate-plan` without configuration.
-- **2026-06-01** — Local path install for iteration, git remote for distribution. Rationale: Pi resolves local paths without copying, so `/reload` is sufficient for the inner loop.
+- **2026-07-14** — Archive via file move to `docs/plans/reference/` rather than a `status` field in state. Rationale: simpler state, plans remain human-readable in a discoverable location, no migration needed for existing state files.
+- **2026-07-14** — Issue drafting triggered at end of `/plan-finish` (not a separate command). Rationale: the plan doc is fresh in context and the agent can draft issues immediately; a separate command adds friction with no benefit.
+- **2026-07-14** — `create_github_issues` and `create_pull_request` as registered tools (not agent-direct CLI). Rationale: the tool pattern gives the extension control over the approval gate and `closes #N` injection, preventing silent or incorrect `gh` invocations.
+- **2026-07-14** — Extension injects `closes #N` rather than instructing the agent to do it. Rationale: the agent may forget or get the numbers wrong; the extension reads from state and injects reliably.
 
 ---
 
 ## Steps
 
-#### Step 1 — Scaffold package structure
+#### Step 1 — Archive closed plans on `/plan-close`
 
 **Recipe**
 
-1. Create `package.json` with Pi package manifest, `pi-package` keyword, and peer dependencies.
-2. Create `extensions/index.ts` with empty default export and the three command stubs (`/plan-start`, `/plan-finish`, `/next-step`).
-3. Install locally via `pi install ~/code/pi-step-plan` and verify Pi loads the extension on startup.
+1. In the `/plan-close` handler in `extensions/index.ts`, after the cleanup commit instruction is sent, use `fs.rename` (with copy-delete fallback on EXDEV) to move the plan file from `docs/plans/<slug>.md` to `docs/plans/reference/<slug>.md`; create `docs/plans/reference/` lazily with `mkdir(..., { recursive: true })` if it does not exist.
+2. Update the `writeState` call that clears `activePlan` to happen only after a successful rename.
 
 **Verify**
 
-- [ ] Pi startup shows the extension loaded with no errors
-- [ ] `/plan-start`, `/plan-finish`, `/next-step` appear as available commands
-- [ ] `/reload` after a no-op edit to `index.ts` reloads cleanly
+- [ ] After `/plan-close`, the plan file no longer appears in `docs/plans/` and is present in `docs/plans/reference/`
+- [ ] `/activate-plan` picker no longer lists the closed plan
+- [ ] If rename fails, the command surfaces an error and does not clear `activePlan` from state
 
 ---
 
-#### Step 2 — Implement `/plan-start` and `/plan-finish`
+#### Step 2 — Add `create_github_issues` tool and extend `/plan-finish`
 
 **Recipe**
 
-1. In `tool_call` handler, block `bash`, `write`, and `edit` when `planMode` is true; notify user of the block.
-2. In `before_agent_start`, inject a system prompt addition when `planMode` is true: agent is in planning mode, discussion only.
-3. `/plan-start` sets `planMode = true` and notifies user.
-4. `/plan-finish` sets `planMode = false`, sends the agent a message instructing it to generate the plan doc from conversation history using the embedded template, writes to the configured path, and commits.
+1. Register a `create_github_issues` tool in `extensions/index.ts` with input schema `{ issues: Array<{ title: string; body: string }> }`. For each draft issue: display title and body to the user, collect approve/edit/skip via `ctx.ui` interactions, iterate on feedback, then run `gh issue create --title <t> --body <b>` for approved ones. Parse the created issue URL to extract the number and append to `state.plans[planPath].githubIssues`.
+2. At the end of the `/plan-finish` agent prompt (after the git commit instruction), add instructions to: read the committed plan, draft one or more GitHub issues framed as problem statements (not plan summaries), and call `create_github_issues` — explicitly prohibiting direct `gh` CLI usage.
 
 **Verify**
 
-- [ ] In plan mode, any agent attempt to call `bash`/`write`/`edit` is blocked with a user notification
-- [ ] `/plan-finish` produces a populated markdown file at the configured path
-- [ ] A clean git commit is created containing only the plan file
-
----
-
-#### Step 3 — Implement `/next-step` with approval gate
-
-**Recipe**
-
-1. `/next-step` reads the configured plan file, finds the first `☐` step, extracts its title and Recipe/Verify/Notes body, and sends it to the agent as a user message.
-2. Extension sets `activeStep` in memory when a step is dispatched.
-3. `agent_end` handler: if `activeStep` is set, show `ctx.ui.confirm()` approval dialog.
-4. On approve: run `git add -A && git commit`, update the plan file to flip `☐ → ☑` for the completed step, clear `activeStep`, then queue `/auto-advance` as a follow-up user message.
-5. `/auto-advance` command calls `ctx.newSession()` with setup that injects the plan file content as initial context, then sends `/next-step` into the new session.
-6. On reject: clear `activeStep`, notify user to provide feedback and re-run `/next-step` when ready.
-
-**Verify**
-
-- [ ] `/next-step` correctly identifies and dispatches the first unchecked step
-- [ ] Approval dialog appears after agent finishes work
-- [ ] On approval, plan file is updated and a clean commit is created
-- [ ] New session starts automatically, pre-seeded with plan file, with `/next-step` already queued
-- [ ] On rejection, state is cleared cleanly and user can re-run
-
----
-
-#### Step 4 — Add state file, `/activate-plan`, and refactor `/next-step` and `/auto-advance` to be state-driven
-
-**Recipe**
-
-1. Add `readState(cwd)` and `writeState(cwd, state)` helpers that read/write `.pi/plan-state.json` with shape `{ activePlan, plans: { [path]: { currentStep, completedSteps[] } } }`. Create `docs/plans/` directory if absent.
-2. Implement `/activate-plan`: scan `docs/plans/` for `*.md` files, present via `ctx.ui.select()`, write/update state setting `activePlan` to chosen path and initializing `{ currentStep: 1, completedSteps: [] }` if not already tracked.
-3. Refactor `/next-step`: remove markdown `☐` scanning; instead read `activePlan` and `currentStep` from state, read that step's content from the plan markdown by step number, send full plan + "implement Step N" to agent, set `activeStep: { number, title }` in memory.
-4. Refactor `/auto-advance`: after approval, increment `currentStep` in state and write state before starting the new session. Remove `markStepComplete` markdown mutation.
-5. Update `/plan-finish` to instruct the agent to write the plan to `docs/plans/<name>.md` (agent picks a slug from the plan title) rather than `dev-plan.md`.
-
-**Verify**
-
-- [ ] `/activate-plan` lists `docs/plans/` files and writes state correctly
-- [ ] `/next-step` dispatches the step number from state, not from `☐` scanning
-- [ ] Completing a step increments `currentStep` in state; re-running `/next-step` dispatches the next step
-- [ ] Switching plans via `/activate-plan` preserves progress on the previously active plan
-- [ ] `/plan-finish` writes the plan under `docs/plans/`
-
----
-
-#### Step 5 — Build `ApprovalComponent` TUI class
-
-**Recipe**
-
-1. Create `extensions/approval-component.ts` exporting `ApprovalAction` (`"approve" | "tweak" | "reject"`) and `ApprovalComponent` implementing the `Component` interface from `@earendil-works/pi-tui`.
-2. Constructor accepts `diffLines: string[]` (pre-truncated, ready to render) and `onDone: (action: ApprovalAction) => void`.
-3. `render()` outputs the diff lines, then a blank line, then the three options with a `>` cursor on the selected one, styled with the theme.
-4. `handleInput()`: up/down moves the cursor, Enter calls `onDone()` with the selected action.
-
-**Verify**
-
-- [ ] Component renders diff block and three options without errors
-- [ ] Arrow keys move selection, Enter on each option calls `onDone` with the correct action
+- [ ] After `/plan-finish`, the agent calls `create_github_issues` with at least one draft issue
+- [ ] Approving an issue runs `gh issue create` and the issue number appears in state
+- [ ] Skipping all issues leaves `githubIssues` as an empty array without error
 
 **Notes**
 
-- Keep this file free of any `pi` or `ctx` references — it is pure TUI, testable in isolation
-- No input handling needed inside the component; tweak feedback is collected separately via `ctx.ui.input()` after the component closes
+- Issue body should describe *the problem being solved*, not reproduce the plan. The agent prompt should make this framing explicit.
 
 ---
 
-#### Step 6 — Wire `ApprovalComponent` into `agent_end` and implement all three outcome flows
+#### Step 3 — Add `create_pull_request` tool and extend `/plan-close`
 
 **Recipe**
 
-1. In `agent_end`, replace the `ctx.ui.confirm()` call with: run `pi.exec("git", ["diff", "--stat"])`, parse the output into file-change lines, truncate to 10 lines (append `  ...and N more files` if truncated), pass to `ApprovalComponent`, and open via `ctx.ui.custom()`.
-2. On **approve**: parse the full `git diff --stat` output to extract changed filenames; derive a commit message formatted as `Step N: update foo.ts, bar.ts[, and N more]`; run `git add -A && git commit -m <message>`; update state to add current step to `completedSteps`; clear `activeStep`; queue `/auto-advance` via `pi.sendUserMessage`.
-3. On **tweak**: call `ctx.ui.input("What do you want to change?")` to collect feedback, then send it as a `followUp` user message via `pi.sendUserMessage`; do NOT clear `activeStep` — it remains set so `agent_end` fires again after the agent finishes, re-entering this same flow with a fresh diff.
-4. On **reject**: clear `activeStep`; call `ctx.ui.notify` telling the user to give feedback and re-run `/next-step`.
+1. Register a `create_pull_request` tool with input schema `{ title: string; body: string }`. The handler reads `githubIssues` from state for the active plan, appends `\n\ncloses #N` for each to the agent-supplied body, displays the full draft title and body to the user for approval/editing, then runs `gh pr create --title <t> --body <b>` on approval.
+2. At the end of the `/plan-close` agent prompt (after the cleanup commit instruction), add instructions to draft a PR title and body and call `create_pull_request` — explicitly prohibiting direct `gh` CLI usage. If no `githubIssues` are stored, the agent should still call the tool; the extension will simply omit the `closes` lines.
 
 **Verify**
 
-- [ ] Approval UI shows truncated diff and three options in a single view after agent finishes a step
-- [ ] Approve commits with a message derived from the diff filenames, not the step title
-- [ ] Tweak sends feedback to the agent and the approval UI reappears after the next `agent_end` with a fresh diff
-- [ ] Reject clears state cleanly and notifies the user
+- [ ] After `/plan-close`, the agent calls `create_pull_request` with a title and body
+- [ ] The displayed PR draft includes `closes #N` for each stored issue number, injected by the extension
+- [ ] Approving runs `gh pr create` and a link to the PR is shown to the user
+- [ ] If no GitHub issues were stored for the plan, the PR draft is shown without `closes` lines and creation still succeeds
+
+---
+
+#### Step 4 — Fix stale and silent state update in `finish_step` approve path
+
+**Recipe**
+
+1. In the `finish_step` `execute` handler in `extensions/index.ts`, replace the state object used in the approve branch with a fresh `readState(ctx.cwd)` call made immediately after the git commit succeeds — do not reuse the `state` captured at the top of `execute`.
+2. After re-reading state, add an explicit error branch: if `planPath` is null or `state.plans[planPath]` is missing, notify the user that state is inconsistent and return an error result rather than silently succeeding.
+
+**Verify**
+
+- [ ] Approving a step after a long tweak session writes the correct `currentStep` even if state was touched externally between the initial read and the approve
+- [ ] If `activePlan` is null when the user clicks approve, an error is surfaced and `currentStep` is not modified
 
 **Notes**
 
-- Commit message derivation: split `git diff --stat` lines, filter to lines matching `filename |`, extract names, join first 3 with `, and N more` suffix if needed
-- The tweak loop requires zero extra state — `activeStep` staying set is the entire mechanism
+- This fixes both Bug 1 (silent skip when guard is false) and Bug 2 (stale state overwrite) with a single change.
 
 ---
 
-#### Step 7 — Implement `/plan-close`
+#### Step 5 — Guard `finish_step` against out-of-context calls
 
 **Recipe**
 
-1. `/plan-close` reads the active plan file path from state and the plan markdown content.
-2. Sends the agent a message with the full plan content + instruction to: review the plan, review the current conversation thread, identify any other files in the repo that should be updated with decisions or outcomes from this plan (READMEs, architecture docs, AGENTS.md, etc.), and make those updates.
-3. After the agent finishes, commit all changes with message `plan-close: <plan name>`.
-4. Update state to clear `activePlan` (or mark the plan as closed).
+1. Add an in-memory variable `let activeStepNumber: number | null = null` alongside the existing `planMode` and `revisePlanPath` variables in `extensions/index.ts`.
+2. In the `/next-step` and `/resume-step` handlers, set `activeStepNumber = stepNumber` immediately before sending the agent message.
+3. At the top of `finish_step` execute, check `activeStepNumber`. If null, return an error result telling the agent it was called outside of an active step dispatch and to stop — do not commit or touch state.
+4. On approve, set `activeStepNumber = null` after writing state. On reject, also set `activeStepNumber = null` so the guard resets cleanly.
 
 **Verify**
 
-- [ ] `/plan-close` sends the agent the plan content and a clear instruction to update relevant repo files
-- [ ] All file updates are committed in a single clean commit
-- [ ] State is updated to reflect the plan is no longer active
+- [ ] Calling `finish_step` in a session where no `/next-step` was run returns an error and does not commit or update state
+- [ ] After a reject, running `/next-step` re-dispatches the same step and `finish_step` accepts it correctly
+- [ ] After an approve, `finish_step` called again in the same session is blocked
+
+**Notes**
+
+- In-memory only — no state file changes. Consistent with the existing `planMode` / `revisePlanPath` pattern. If Pi restarts mid-session the guard resets to null, which is fine: the agent's session context is also gone so it cannot spontaneously re-call `finish_step`.
 
 ---
 
 ## Phase 2 (Future)
 
-- Auto-advance option: after approval, automatically dispatch the next step without manual `/next-step`
-- Rejection flow enhancement: prompt "what should change?" and re-send step with feedback appended
-- Publish to npm/git for one-command install across machines
+- Surface a `--show-archived` flag on `/activate-plan` to list plans in `docs/plans/reference/` and optionally restore one
+- Add a `gh pr merge` flow or webhook listener so the extension can confirm issue closure after merge
+- Allow the user to associate an existing GitHub issue (by number) with a plan rather than always creating new ones

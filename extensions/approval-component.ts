@@ -8,7 +8,7 @@
  * tested in isolation.
  */
 
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ export class ApprovalComponent {
 
     // Diff block
     for (const line of this.diffLines) {
-      lines.push(truncateToWidth(line, width));
+      lines.push(...wrapTextWithAnsi(line, width));
     }
 
     // Separator

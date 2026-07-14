@@ -2,7 +2,8 @@ import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ApprovalComponent } from "./approval-component.js";
 import type { ApprovalAction } from "./approval-component.js";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { copyFile, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // ─── Embedded plan doc template ───────────────────────────────────────────────
@@ -148,52 +149,88 @@ interface ActiveStep {
 }
 
 /**
- * Extract a specific step's content by step number from a plan markdown file.
- * Returns null if the step number is not found.
+ * Find the next step with a number >= stepNumber.
+ * Returns null if no such step exists (all steps complete).
  */
 function findStepByNumber(content: string, stepNumber: number): ActiveStep | null {
   const lines = content.split("\n");
-  const stepHeadingRe = /^#### Step (\d+) — (.+)$/;
+  const stepHeadingRe = /^#### Step (\d+) [\u2014\u2013-] (.+)$/;
 
   for (let i = 0; i < lines.length; i++) {
     const match = lines[i].match(stepHeadingRe);
     if (!match) continue;
-    if (parseInt(match[1], 10) !== stepNumber) continue;
+    if (parseInt(match[1], 10) < stepNumber) continue;
 
+    const num = parseInt(match[1], 10);
     const title = match[2].trim();
 
-    // Collect body: lines until the next #### or ## heading or end of file
+    // Collect body: lines until the next step heading or end of file
     const bodyLines: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
-      if (lines[j].startsWith("#### ") || lines[j].startsWith("## ")) break;
+      if (stepHeadingRe.test(lines[j])) break;
       bodyLines.push(lines[j]);
     }
 
-    return { number: stepNumber, title, body: bodyLines.join("\n").trim() };
+    return { number: num, title, body: bodyLines.join("\n").trim() };
   }
 
   return null;
 }
 
-/**
- * Count total steps in a plan file.
- */
-function countSteps(content: string): number {
-  const matches = content.match(/^#### Step \d+ — /gm);
-  return matches ? matches.length : 0;
+// ─── Extension ────────────────────────────────────────────────────────────────
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+function notifyOSC777(title: string, body: string): void {
+  process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
+}
+
+function notifyOSC99(title: string, body: string): void {
+  process.stdout.write(`\x1b]99;i=1:d=0;${title}\x1b\\`);
+  process.stdout.write(`\x1b]99;i=1:p=body;${body}\x1b\\`);
+}
+
+function notifyWindows(title: string, body: string): void {
+  const type = "Windows.UI.Notifications";
+  const mgr = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
+  const template = `[${type}.ToastTemplateType]::ToastText01`;
+  const toast = `[${type}.ToastNotification]::new($xml)`;
+  const script = [
+    `${mgr} > $null`,
+    `$xml = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
+    `$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('${body}')) > $null`,
+    `[${type}.ToastNotificationManager]::CreateToastNotifier('${title}').Show(${toast})`,
+  ].join("; ");
+  execFile("powershell.exe", ["-NoProfile", "-Command", script]);
+}
+
+function notify(title: string, body: string): void {
+  if (process.env.WT_SESSION) {
+    notifyWindows(title, body);
+  } else if (process.env.KITTY_WINDOW_ID) {
+    notifyOSC99(title, body);
+  } else {
+    notifyOSC777(title, body);
+  }
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  pi.on("agent_end", () => {
+    notify("Pi", "Ready for input");
+  });
+
   let planMode = false;
+  let revisePlanPath: string | null = null; // non-null when entered via /revise-plan
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
   pi.registerTool({
     name: "finish_step",
     label: "Finish Step",
     description:
-      "Call this when you have finished implementing the current step. " +
+      "Call this ONLY when you have been explicitly dispatched a step via /next-step or /resume-step and have finished implementing it. " +
+      "Do NOT call this during normal conversations, bug fixes, or any work outside of an active plan step. " +
       "Write a conventional commit message summarising exactly what you changed.",
     parameters: Type.Object({
       commitMessage: Type.String({
@@ -246,7 +283,12 @@ export default function (pi: ExtensionAPI) {
       // ── Reject ────────────────────────────────────────────────────────────
       if (!action || action === "reject") {
         return {
-          content: [{ type: "text", text: "Step rejected by user. Stop and wait for further instructions." }],
+          content: [
+            {
+              type: "text",
+              text: "Step rejected by user. Stop and wait for further instructions.",
+            },
+          ],
           details: undefined,
         };
       }
@@ -255,12 +297,14 @@ export default function (pi: ExtensionAPI) {
       if (action === "tweak") {
         const feedback = await ctx.ui.input("What do you want to change?");
         return {
-          content: [{
-            type: "text",
-            text: feedback
-              ? `User feedback: ${feedback}. Please make the requested changes and call finish_step again when done.`
-              : "User requested changes. Please review your work and call finish_step again when done.",
-          }],
+          content: [
+            {
+              type: "text",
+              text: feedback
+                ? `User feedback: ${feedback}. Please make the requested changes and call finish_step again when done.`
+                : "User requested changes. Please review your work and call finish_step again when done.",
+            },
+          ],
           details: undefined,
         };
       }
@@ -290,10 +334,13 @@ export default function (pi: ExtensionAPI) {
         await writeState(ctx.cwd, state);
       }
 
-      pi.sendUserMessage("/auto-advance", { deliverAs: "followUp" });
-
       return {
-        content: [{ type: "text", text: `Step committed successfully: "${commitMsg}". Auto-advancing to next step.` }],
+        content: [
+          {
+            type: "text",
+            text: `Step committed successfully: "${commitMsg}". Start a new session and run /next-step to continue.`,
+          },
+        ],
         details: undefined,
       };
     },
@@ -304,15 +351,22 @@ export default function (pi: ExtensionAPI) {
     if (!planMode) return;
 
     if (["write", "edit"].includes(event.toolName)) {
+      // In all plan modes, allow writes anywhere inside docs/
+      const inputPath = (event.input as { path?: string }).path;
+      if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
+
+      const exitCmd = revisePlanPath ? "/resume-step" : "/plan-finish";
       ctx.ui.notify(
-        `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
+        `⏸ Plan mode: \`${event.toolName}\` blocked. Use ${exitCmd} to exit planning.`,
         "warning",
       );
       return {
         block: true,
-        reason:
-          "Plan mode is active. write and edit are disabled during planning. " +
-          "Discuss and plan only — no implementation. Run /plan-finish when done.",
+        reason: revisePlanPath
+          ? "Plan revision mode is active. write and edit are disabled outside of docs/. " +
+            "Edit docs only — no implementation. Run /resume-step when done."
+          : "Plan mode is active. write and edit are disabled outside of docs/. " +
+            "Discuss and plan only — no implementation. Run /plan-finish when done.",
       };
     }
   });
@@ -320,6 +374,24 @@ export default function (pi: ExtensionAPI) {
   // ── Inject system prompt addition in plan mode ──────────────────────────────
   pi.on("before_agent_start", (event) => {
     if (!planMode) return;
+
+    if (revisePlanPath) {
+      return {
+        systemPrompt:
+          event.systemPrompt +
+          `\n\n## ⏸ PLAN REVISION MODE ACTIVE\n` +
+          `Step execution is paused. Your ONLY job right now is to discuss and revise the plan doc.\n` +
+          `\n` +
+          `**You must NOT:**\n` +
+          `- Call write or edit on any file outside the docs/ directory\n` +
+          `- Implement any code\n` +
+          `\n` +
+          `**You MUST:**\n` +
+          `- Discuss what needs to change with the user\n` +
+          `- Edit the plan doc directly when changes are agreed upon\n` +
+          `- Stay in revision mode until the user runs /resume-step\n`,
+      };
+    }
 
     return {
       systemPrompt:
@@ -329,7 +401,7 @@ export default function (pi: ExtensionAPI) {
         `ask clarifying questions, and discuss the approach.\n` +
         `\n` +
         `**You must NOT:**\n` +
-        `- Call write or edit under any circumstances\n` +
+        `- Call write or edit outside of the docs/ directory\n` +
         `- Start implementing anything\n` +
         `- Write code in responses unless it is illustrative pseudocode\n` +
         `\n` +
@@ -381,6 +453,101 @@ export default function (pi: ExtensionAPI) {
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
+    },
+  });
+
+  // ── /revise-plan ─────────────────────────────────────────────────────────────
+  pi.registerCommand("revise-plan", {
+    description: "Pause step execution and enter planning mode to revise the active plan",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+      const progress = state.plans[planPath];
+      const stepNumber = progress?.currentStep ?? 1;
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      planMode = true;
+      revisePlanPath = planPath;
+
+      ctx.ui.notify(
+        `⏸ Revise mode enabled. Execution of step ${stepNumber} paused.\n` +
+          `Only edits to the plan file are allowed. Run /resume-step when done.`,
+        "info",
+      );
+
+      pi.sendUserMessage(
+        `Execution of **Step ${stepNumber}** is paused for plan revision.\n\n` +
+          `Here is the current plan:\n\n${planContent}\n\n` +
+          `Tell the user you are ready to discuss changes and ask what they want to change. Do not analyze the plan or suggest changes yourself.`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
+
+  // ── /resume-step ─────────────────────────────────────────────────────────────
+  pi.registerCommand("resume-step", {
+    description: "Exit plan revision mode and resume execution of the current step",
+    handler: async (_args, ctx) => {
+      planMode = false;
+      revisePlanPath = null;
+
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+      const progress = state.plans[planPath] ?? { currentStep: 1, completedSteps: [] };
+      const stepNumber = progress.currentStep;
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      const step = findStepByNumber(planContent, stepNumber);
+      if (!step) {
+        ctx.ui.notify(`Step ${stepNumber} not found in ${planPath}.`, "error");
+        return;
+      }
+
+      const { stdout: diff } = await pi.exec("git", ["diff", "HEAD"]);
+
+      const diffSection = diff.trim()
+        ? `## Partial work already done on this step\n\nThe following changes were made before the plan was revised:\n\n\`\`\`diff\n${diff}\n\`\`\``
+        : `## Partial work\n\nNo changes have been made yet on this step.`;
+
+      ctx.ui.notify(`Resuming Step ${stepNumber}: ${step.title}`, "info");
+
+      const message =
+        `## Updated Plan\n\n${planContent}\n\n---\n\n` +
+        `${diffSection}\n\n---\n\n` +
+        `## Your task\n\n` +
+        `Continue implementing **Step ${stepNumber} — ${step.title}**.\n\n` +
+        `Step content:\n\n${step.body}\n\n` +
+        `Take into account both the updated plan and the partial work already done above. ` +
+        `Complete the step, then call the \`finish_step\` tool with a conventional commit message. ` +
+        `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
+
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
     },
   });
 
@@ -461,17 +628,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const totalSteps = countSteps(planContent);
       const stepNumber = progress.currentStep;
-
-      if (stepNumber > totalSteps) {
-        ctx.ui.notify(`🎉 All ${totalSteps} steps complete! Run /plan-close to finalize.`, "info");
-        return;
-      }
-
       const step = findStepByNumber(planContent, stepNumber);
+
       if (!step) {
-        ctx.ui.notify(`Step ${stepNumber} not found in ${planPath}. Check the plan file.`, "error");
+        ctx.ui.notify(`🎉 All steps complete! Run /plan-close to finalize.`, "info");
         return;
       }
 
@@ -487,22 +648,6 @@ export default function (pi: ExtensionAPI) {
         `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
 
       pi.sendUserMessage(message, { deliverAs: "followUp" });
-    },
-  });
-
-  // ── /auto-advance ────────────────────────────────────────────────────────────
-  pi.registerCommand("auto-advance", {
-    description: "Internal: start a new session pre-seeded with plan context and run /next-step",
-    handler: async (_args, ctx) => {
-      const result = await ctx.newSession({
-        withSession: async (replacementCtx) => {
-          await replacementCtx.sendUserMessage("/next-step");
-        },
-      });
-
-      if (result.cancelled) {
-        ctx.ui.notify("New session cancelled — run /next-step manually to continue.", "warning");
-      }
     },
   });
 
@@ -545,7 +690,32 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "followUp" },
       );
 
-      // Clear activePlan from state
+      // Archive the plan file to docs/plans/reference/ before clearing state
+      const planFileName = planPath.split("/").pop()!;
+      const refDir = join(ctx.cwd, PLANS_DIR, "reference");
+      const srcPath = join(ctx.cwd, planPath);
+      const destPath = join(refDir, planFileName);
+
+      try {
+        await mkdir(refDir, { recursive: true });
+        try {
+          await rename(srcPath, destPath);
+        } catch (err: unknown) {
+          // EXDEV: cross-device rename — fall back to copy + delete
+          if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+            await copyFile(srcPath, destPath);
+            await unlink(srcPath);
+          } else {
+            throw err;
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Failed to archive plan file: ${msg}`, "error");
+        return;
+      }
+
+      // Clear activePlan from state — only after successful archive
       const updatedState = await readState(ctx.cwd);
       updatedState.activePlan = null;
       await writeState(ctx.cwd, updatedState);
