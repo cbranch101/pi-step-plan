@@ -982,4 +982,82 @@ export default function (pi: ExtensionAPI) {
       await writeState(ctx.cwd, updatedState);
     },
   });
+
+  // ── /plan-adopt ──────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-adopt", {
+    description: "Adopt a pre-created plan doc from docs/plans/ without running /plan-start",
+    handler: async (_args, ctx) => {
+      await mkdir(join(ctx.cwd, PLANS_DIR), { recursive: true });
+
+      const state = await readState(ctx.cwd);
+
+      // Find .md files in docs/plans/ that are not already tracked in state
+      const allFiles = (await readdir(join(ctx.cwd, PLANS_DIR)))
+        .filter((f) => f.endsWith(".md"))
+        .sort();
+
+      const unadoptedFiles = allFiles.filter((f) => {
+        const planPath = `${PLANS_DIR}/${f}`;
+        return !state.plans[planPath];
+      });
+
+      if (unadoptedFiles.length === 0) {
+        ctx.ui.notify(
+          `No untracked plan files found in ${PLANS_DIR}/. ` +
+            `All existing .md files are already in state, or the directory is empty.`,
+          "warning",
+        );
+        return;
+      }
+
+      let selectedFile: string;
+      if (unadoptedFiles.length === 1) {
+        selectedFile = unadoptedFiles[0]!;
+      } else {
+        const selected = await ctx.ui.select(
+          "Select a plan to adopt",
+          unadoptedFiles,
+        );
+        if (!selected) {
+          ctx.ui.notify("No plan selected.", "info");
+          return;
+        }
+        selectedFile = selected;
+      }
+
+      const planPath = `${PLANS_DIR}/${selectedFile}`;
+      const slug = selectedFile.replace(/\.md$/, "");
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      // Initialize state for the adopted plan and set it as active
+      state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [] };
+      state.activePlan = planPath;
+      await writeState(ctx.cwd, state);
+
+      ctx.ui.notify(`Adopting plan: ${planPath}`, "info");
+
+      pi.sendUserMessage(
+        `A pre-created plan doc is being adopted. Please do the following:\n\n` +
+          `1. Read the plan below carefully.\n` +
+          `2. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
+          `3. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
+          `4. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n` +
+          `5. After committing, re-read the committed plan file and draft one or more GitHub issues ` +
+          `that represent the *problems being solved* by this plan — not a summary of the plan itself. ` +
+          `Each issue should be framed as a problem statement a developer could act on independently.\n` +
+          `6. Call the \`create_github_issues\` tool with the drafted issues. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
+          `## Plan file: ${planPath}\n\n` +
+          `## Plan content\n\n${planContent}`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
 }
