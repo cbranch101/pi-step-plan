@@ -342,6 +342,26 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 
 ---
 
+#### Step 6 — Add `/plan-adopt` command for pre-created plan docs
+
+**Recipe**
+
+1. Register a `plan-adopt` command in `extensions/index.ts`. In the handler, scan `docs/plans/*.md` for files whose path is not already a key in `state.plans`. If none are found, notify the user and return. If multiple are found, present them via `ctx.ui.select`; if exactly one is found, use it directly.
+2. Read the selected file's content, then send the agent a prompt that skips doc generation entirely: review the existing plan with the user, incorporate any feedback by editing the file directly, commit it (`git add -A && git commit -m "Add plan doc: <slug>"`), then draft GitHub issues and call `create_github_issues`. Use the same issue-drafting instructions as in `/plan-finish`.
+
+**Verify**
+
+- [ ] Running `/plan-adopt` with a pre-created `.md` in `docs/plans/` presents it to the agent without any template generation step
+- [ ] If no untracked plan files exist, a clear warning is shown and no agent message is sent
+- [ ] After the agent commits and calls `create_github_issues`, issue numbers appear in state as they do after `/plan-finish`
+
+**Notes**
+
+- `planMode` does not need to be set — `/plan-adopt` is not a planning session, it's an adoption handoff. The write/edit block does not apply.
+- Keep `/plan-finish` unchanged; this command is purely additive.
+
+---
+
 ## Phase 2 (Future)
 
 - Surface a `--show-archived` flag on `/activate-plan` to list plans in `docs/plans/reference/` and optionally restore one
