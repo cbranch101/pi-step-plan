@@ -240,8 +240,6 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
       const commitMsg = params.commitMessage;
 
       // Collect diff --stat output
@@ -324,16 +322,30 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Committed: ${commitMsg}`, "info");
 
-      // Update state
-      if (planPath && state.plans[planPath]) {
-        const progress = state.plans[planPath];
-        const stepNumber = progress.currentStep;
-        if (!progress.completedSteps.includes(stepNumber)) {
-          progress.completedSteps.push(stepNumber);
-        }
-        progress.currentStep = stepNumber + 1;
-        await writeState(ctx.cwd, state);
+      // Re-read state after commit to avoid stale-state overwrites
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+
+      if (!planPath || !state.plans[planPath]) {
+        ctx.ui.notify("State is inconsistent: no active plan found after commit.", "error");
+        return {
+          content: [
+            {
+              type: "text",
+              text: "State is inconsistent: activePlan is null or missing from plans map. currentStep was not updated. Do not proceed.",
+            },
+          ],
+          details: undefined,
+        };
       }
+
+      const progress = state.plans[planPath];
+      const stepNumber = progress.currentStep;
+      if (!progress.completedSteps.includes(stepNumber)) {
+        progress.completedSteps.push(stepNumber);
+      }
+      progress.currentStep = stepNumber + 1;
+      await writeState(ctx.cwd, state);
 
       return {
         content: [
