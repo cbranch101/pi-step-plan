@@ -464,6 +464,109 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── create_pull_request tool — agent calls this after /plan-close commit ────
+  pi.registerTool({
+    name: "create_pull_request",
+    label: "Create Pull Request",
+    description:
+      "Call this after the cleanup commit during /plan-close. " +
+      "Submit a drafted PR title and body for user review; the extension will inject 'closes #N' lines " +
+      "for any GitHub issues stored in state, then handle confirmation and creation via gh. " +
+      "Do NOT run gh commands directly. If the tool returns feedback, revise and call this tool again.",
+    parameters: Type.Object({
+      title: Type.String({ description: "PR title" }),
+      body: Type.String({ description: "PR body describing what this PR does" }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+
+      // Inject closes #N lines from stored issue numbers
+      const planProgress = planPath != null ? state.plans[planPath] : null;
+      const issueNumbers: number[] = planProgress?.githubIssues ?? [];
+
+      const closesLines =
+        issueNumbers.length > 0
+          ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n")
+          : "";
+
+      const fullBody = params.body + closesLines;
+
+      const confirmed = await ctx.ui.confirm(
+        `Create this PR: "${params.title}"?`,
+        fullBody,
+      );
+
+      if (!confirmed) {
+        const feedback = await ctx.ui.input(
+          "What do you want to change about the PR? (leave blank to cancel)",
+        );
+        if (feedback?.trim()) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `User declined the PR with feedback: ${feedback.trim()}. ` +
+                  `Please revise the title and/or body and call create_pull_request again.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "PR creation cancelled by user." }],
+          details: undefined,
+        };
+      }
+
+      let ghOutput: string;
+      try {
+        const { code, stdout, stderr } = await pi.exec("gh", [
+          "pr", "create",
+          "--title", params.title,
+          "--body", fullBody,
+        ]);
+        if (code !== 0) {
+          ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
+          return {
+            content: [
+              {
+                type: "text",
+                text: `gh pr create failed: ${stderr}. Do not proceed.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+        ghOutput = stdout.trim();
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`gh not available: ${msg}`, "error");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `gh is not installed or not authenticated: ${msg}. Cannot create PR.`,
+            },
+          ],
+          details: undefined,
+        };
+      }
+
+      ctx.ui.notify(`PR created: ${ghOutput}`, "info");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Pull request created successfully: ${ghOutput}`,
+          },
+        ],
+        details: undefined,
+      };
+    },
+  });
+
   // ── Block destructive tools in plan mode ────────────────────────────────────
   pi.on("tool_call", (event, ctx) => {
     if (!planMode) return;
@@ -807,7 +910,10 @@ export default function (pi: ExtensionAPI) {
           `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
           `3. Make those updates now using the write and edit tools.\n` +
           `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
-          `5. After committing, your work here is complete.\n\n` +
+          `5. After committing, draft a pull request title and a concise body describing what this plan accomplished. ` +
+          `Then call the \`create_pull_request\` tool with the draft. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
+          `If no GitHub issues were stored for this plan, the tool will handle that gracefully.\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
