@@ -1010,6 +1010,12 @@ export default function (pi: ExtensionAPI) {
       const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
       const commitMsg = `plan-close: ${planName}`;
 
+      const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
+      const issueNumbersNote =
+        storedIssueNumbers.length > 0
+          ? `The following GitHub issue numbers were created for this plan and must be passed as \`issueNumbers\` to \`create_pull_request\`: [${storedIssueNumbers.join(", ")}].`
+          : `No GitHub issues were created for this plan. Pass an empty array for \`issueNumbers\`.`;
+
       pi.sendUserMessage(
         `The active plan has been completed. Please do the following:\n\n` +
           `1. Review the full plan below and the current conversation thread.\n` +
@@ -1018,9 +1024,9 @@ export default function (pi: ExtensionAPI) {
           `3. Make those updates now using the write and edit tools.\n` +
           `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
           `5. After committing, draft a pull request title and a concise body describing what this plan accomplished. ` +
-          `Then call the \`create_pull_request\` tool with the draft title, body, and the issue numbers returned by \`create_github_issues\` earlier in this session. ` +
-          `Pass an empty array for issueNumbers if no issues were created. ` +
+          `Then call the \`create_pull_request\` tool with the draft title, body, and the issue numbers listed below. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
+          `${issueNumbersNote}\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
