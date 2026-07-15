@@ -388,6 +388,22 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 
 ---
 
+#### Step 8 — Add feature branch creation to `/plan-finish`/`/plan-adopt` agent flow and fix `create_pull_request` issue number passing
+
+**Recipe**
+
+1. Update the `/plan-finish` agent prompt to add a step immediately after slug selection: run `git checkout -b feature/<slug> main` before writing the plan doc. All subsequent writes and commits happen on that branch.
+2. Update the `/plan-adopt` agent prompt to add the same branch creation step — after reading the plan file and determining the slug from its filename, run `git checkout -b feature/<slug> main` before making any commits.
+3. Add `issueNumbers: Type.Array(Type.Number())` to the `create_pull_request` input schema. Remove the `state.activePlan` lookup from its handler and use `params.issueNumbers` directly to build the `closes #N` lines. Update the `/plan-close` agent prompt to instruct the agent to pass the issue numbers it received from `create_github_issues` when calling `create_pull_request`.
+
+**Verify**
+
+- [ ] After `/plan-finish`, the working branch is `feature/<slug>` and the plan doc commit appears on it
+- [ ] After `/plan-adopt`, the working branch is `feature/<slug>` and the adopted plan doc commit appears on it
+- [ ] After `/plan-close`, the PR draft includes `closes #N` for each issue number the agent passed to `create_pull_request`
+
+---
+
 ## Phase 2 (Future)
 
 - Surface a `--show-archived` flag on `/activate-plan` to list plans in `docs/plans/reference/` and optionally restore one

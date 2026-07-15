@@ -121,6 +121,7 @@ interface PlanProgress {
   currentStep: number;
   completedSteps: number[];
   githubIssues: number[];
+  branch: string | null;
 }
 
 interface PlanState {
@@ -562,20 +563,19 @@ export default function (pi: ExtensionAPI) {
     label: "Create Pull Request",
     description:
       "Call this after the cleanup commit during /plan-close. " +
-      "Submit a drafted PR title and body for user review; the extension will inject 'closes #N' lines " +
-      "for any GitHub issues stored in state, then handle confirmation and creation via gh. " +
+      "Submit the drafted PR title, body, and the issue numbers returned by create_github_issues. " +
+      "The extension will inject 'closes #N' lines for each issue number, then handle confirmation and creation via gh. " +
       "Do NOT run gh commands directly. If the tool returns feedback, revise and call this tool again.",
     parameters: Type.Object({
       title: Type.String({ description: "PR title" }),
       body: Type.String({ description: "PR body describing what this PR does" }),
+      issueNumbers: Type.Array(Type.Number(), {
+        description:
+          "GitHub issue numbers to close with this PR — pass the numbers returned by create_github_issues. Pass an empty array if no issues were created.",
+      }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
-
-      // Inject closes #N lines from stored issue numbers
-      const planProgress = planPath != null ? state.plans[planPath] : null;
-      const issueNumbers: number[] = planProgress?.githubIssues ?? [];
+      const issueNumbers: number[] = params.issueNumbers;
 
       const closesLines =
         issueNumbers.length > 0
@@ -759,17 +759,18 @@ export default function (pi: ExtensionAPI) {
           `1. Review our full conversation above and extract all decisions, goals, constraints, ` +
           `architecture choices, and action items.\n` +
           `2. Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign").\n` +
-          `3. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
-          `4. Ask the user if they have any feedback or changes to the file.\n` +
-          `5. Incorporate any feedback by editing the file, repeating step 4 until the user is satisfied.\n` +
-          `6. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `7. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `3. Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
+          `4. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
+          `5. Ask the user if they have any feedback or changes to the file.\n` +
+          `6. Incorporate any feedback by editing the file, repeating step 5 until the user is satisfied.\n` +
+          `7. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
+          `8. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
           `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
-          `8. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `9. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
           `If the user requests changes, revise the outline and call the tool again. ` +
           `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
-          `9. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
+          `10. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
@@ -912,18 +913,25 @@ export default function (pi: ExtensionAPI) {
       // Extract filename from display string
       const selectedFile = files[options.indexOf(selected)];
       const planPath = `${PLANS_DIR}/${selectedFile}`;
+      const slug = selectedFile!.replace(/\.md$/, "");
 
       // Initialize state for this plan if not already tracked
       if (!state.plans[planPath]) {
-        state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [] };
+        state.plans[planPath] = {
+          currentStep: 1,
+          completedSteps: [],
+          githubIssues: [],
+          branch: `feature/${slug}`,
+        };
       }
       state.activePlan = planPath;
       await writeState(ctx.cwd, state);
 
-      const progress = state.plans[planPath];
+      const progress = state.plans[planPath]!;
+      const branchNote = progress.branch ? ` | Branch: ${progress.branch}` : "";
       ctx.ui.notify(
         `✅ Active plan set to: ${planPath}\n` +
-          `Current step: ${progress.currentStep} | Completed: [${progress.completedSteps.join(", ")}]`,
+          `Current step: ${progress.currentStep} | Completed: [${progress.completedSteps.join(", ")}]${branchNote}`,
         "info",
       );
     },
@@ -1010,9 +1018,9 @@ export default function (pi: ExtensionAPI) {
           `3. Make those updates now using the write and edit tools.\n` +
           `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
           `5. After committing, draft a pull request title and a concise body describing what this plan accomplished. ` +
-          `Then call the \`create_pull_request\` tool with the draft. ` +
-          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
-          `If no GitHub issues were stored for this plan, the tool will handle that gracefully.\n\n` +
+          `Then call the \`create_pull_request\` tool with the draft title, body, and the issue numbers returned by \`create_github_issues\` earlier in this session. ` +
+          `Pass an empty array for issueNumbers if no issues were created. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
@@ -1104,7 +1112,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Initialize state for the adopted plan and set it as active
-      state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [] };
+      state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [], branch: `feature/${slug}` };
       state.activePlan = planPath;
       await writeState(ctx.cwd, state);
 
@@ -1115,14 +1123,15 @@ export default function (pi: ExtensionAPI) {
           `1. Read the plan below carefully.\n` +
           `2. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
           `3. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
-          `4. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n` +
-          `5. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `4. Check the current branch with \`git branch --show-current\`. If it is already \`feature/${slug}\`, skip branch creation. Otherwise run \`git checkout -b feature/${slug} main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
+          `5. Once the user approves the plan, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n` +
+          `6. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
           `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
-          `6. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `7. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
           `If the user requests changes, revise the outline and call the tool again. ` +
           `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
-          `7. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
+          `8. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `## Plan file: ${planPath}\n\n` +
           `## Plan content\n\n${planContent}`,
