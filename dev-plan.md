@@ -333,12 +333,12 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 1. Add an in-memory variable `let activeStepNumber: number | null = null` alongside the existing `planMode` and `revisePlanPath` variables in `extensions/index.ts`.
 2. In the `/next-step` and `/resume-step` handlers, set `activeStepNumber = stepNumber` immediately before sending the agent message.
 3. At the top of `finish_step` execute, check `activeStepNumber`. If null, return an error result telling the agent it was called outside of an active step dispatch and to stop — do not commit or touch state.
-4. On approve, set `activeStepNumber = null` after writing state. On reject, also set `activeStepNumber = null` so the guard resets cleanly.
+4. On approve, set `activeStepNumber = null` after writing state. On reject, do NOT clear `activeStepNumber` — the step is still active; the agent stops and waits, but must be able to call `finish_step` again once the user gives new direction.
 
 **Verify**
 
 - [ ] Calling `finish_step` in a session where no `/next-step` was run returns an error and does not commit or update state
-- [ ] After a reject, running `/next-step` re-dispatches the same step and `finish_step` accepts it correctly
+- [ ] After a reject, the agent can call `finish_step` again directly (no `/next-step` or `/resume-step` required) because `activeStepNumber` is preserved
 - [ ] After an approve, `finish_step` called again in the same session is blocked
 
 **Notes**

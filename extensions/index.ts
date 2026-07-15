@@ -296,7 +296,6 @@ export default function (pi: ExtensionAPI) {
 
       // ── Reject ────────────────────────────────────────────────────────────
       if (!action || action === "reject") {
-        activeStepNumber = null;
         return {
           content: [
             {
@@ -463,7 +462,9 @@ export default function (pi: ExtensionAPI) {
 
       if (!planPath || !state.plans[planPath]) {
         return {
-          content: [{ type: "text", text: "No active plan found in state. Cannot create GitHub issues." }],
+          content: [
+            { type: "text", text: "No active plan found in state. Cannot create GitHub issues." },
+          ],
           details: undefined,
         };
       }
@@ -472,23 +473,28 @@ export default function (pi: ExtensionAPI) {
       const feedbackItems: string[] = [];
 
       for (const issue of params.issues) {
-        const confirmed = await ctx.ui.confirm(
-          `Create this issue: "${issue.title}"?`,
-          issue.body,
-        );
+        const confirmed = await ctx.ui.confirm(`Create this issue: "${issue.title}"?`, issue.body);
 
         if (confirmed) {
           let ghOutput: string;
           try {
             const { code, stdout, stderr } = await pi.exec("gh", [
-              "issue", "create",
-              "--title", issue.title,
-              "--body", issue.body,
+              "issue",
+              "create",
+              "--title",
+              issue.title,
+              "--body",
+              issue.body,
             ]);
             if (code !== 0) {
               ctx.ui.notify(`gh issue create failed: ${stderr}`, "error");
               return {
-                content: [{ type: "text", text: `gh issue create failed: ${stderr}. Do not proceed with remaining issues.` }],
+                content: [
+                  {
+                    type: "text",
+                    text: `gh issue create failed: ${stderr}. Do not proceed with remaining issues.`,
+                  },
+                ],
                 details: undefined,
               };
             }
@@ -497,7 +503,12 @@ export default function (pi: ExtensionAPI) {
             const msg = err instanceof Error ? err.message : String(err);
             ctx.ui.notify(`gh not available: ${msg}`, "error");
             return {
-              content: [{ type: "text", text: `gh is not installed or not authenticated: ${msg}. Cannot create issues.` }],
+              content: [
+                {
+                  type: "text",
+                  text: `gh is not installed or not authenticated: ${msg}. Cannot create issues.`,
+                },
+              ],
               details: undefined,
             };
           }
@@ -512,7 +523,9 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify(`Issue created but could not parse number from: ${ghOutput}`, "warning");
           }
         } else {
-          const feedback = await ctx.ui.input(`Any feedback on "${issue.title}"? (leave blank to skip)`);
+          const feedback = await ctx.ui.input(
+            `Any feedback on "${issue.title}"? (leave blank to skip)`,
+          );
           if (feedback?.trim()) {
             feedbackItems.push(`- "${issue.title}": ${feedback.trim()}`);
           }
@@ -539,13 +552,15 @@ export default function (pi: ExtensionAPI) {
 
       if (feedbackItems.length > 0) {
         return {
-          content: [{
-            type: "text",
-            text:
-              `${createdSummary}\n\n` +
-              `The following issues were declined with feedback — please revise them and call create_github_issues again:\n` +
-              feedbackItems.join("\n"),
-          }],
+          content: [
+            {
+              type: "text",
+              text:
+                `${createdSummary}\n\n` +
+                `The following issues were declined with feedback — please revise them and call create_github_issues again:\n` +
+                feedbackItems.join("\n"),
+            },
+          ],
           details: undefined,
         };
       }
@@ -578,16 +593,11 @@ export default function (pi: ExtensionAPI) {
       const issueNumbers: number[] = params.issueNumbers;
 
       const closesLines =
-        issueNumbers.length > 0
-          ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n")
-          : "";
+        issueNumbers.length > 0 ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n") : "";
 
       const fullBody = params.body + closesLines;
 
-      const confirmed = await ctx.ui.confirm(
-        `Create this PR: "${params.title}"?`,
-        fullBody,
-      );
+      const confirmed = await ctx.ui.confirm(`Create this PR: "${params.title}"?`, fullBody);
 
       if (!confirmed) {
         const feedback = await ctx.ui.input(
@@ -615,9 +625,12 @@ export default function (pi: ExtensionAPI) {
       let ghOutput: string;
       try {
         const { code, stdout, stderr } = await pi.exec("gh", [
-          "pr", "create",
-          "--title", params.title,
-          "--body", fullBody,
+          "pr",
+          "create",
+          "--title",
+          params.title,
+          "--body",
+          fullBody,
         ]);
         if (code !== 0) {
           ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
@@ -1095,10 +1108,7 @@ export default function (pi: ExtensionAPI) {
       if (unadoptedFiles.length === 1) {
         selectedFile = unadoptedFiles[0]!;
       } else {
-        const selected = await ctx.ui.select(
-          "Select a plan to adopt",
-          unadoptedFiles,
-        );
+        const selected = await ctx.ui.select("Select a plan to adopt", unadoptedFiles);
         if (!selected) {
           ctx.ui.notify("No plan selected.", "info");
           return;
@@ -1118,7 +1128,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Initialize state for the adopted plan and set it as active
-      state.plans[planPath] = { currentStep: 1, completedSteps: [], githubIssues: [], branch: `feature/${slug}` };
+      state.plans[planPath] = {
+        currentStep: 1,
+        completedSteps: [],
+        githubIssues: [],
+        branch: `feature/${slug}`,
+      };
       state.activePlan = planPath;
       await writeState(ctx.cwd, state);
 
