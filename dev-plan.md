@@ -404,6 +404,56 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 
 ---
 
+#### Step 9 — Commit `plan-state.json` with the step (reorder `finish_step` approve path)
+
+**Recipe**
+
+1. In the `finish_step` approve branch in `extensions/index.ts`, move the state update so it runs **before** `git add` / `git commit`: re-read state (`readState`), append `currentStep` to `completedSteps` if needed, bump `currentStep`, `writeState`, then `git add -A` and `git commit -m <approved message>`.
+2. Remove the post-commit state write. Keep the existing inconsistent-state error if `activePlan` is null or missing from `plans` — that check now runs before commit. Clear `activeStepNumber` only after a successful commit, same as today.
+3. Do not add commit-failure rollback logic. If commit fails, return the error as today and leave the updated state file on disk for the user to resolve.
+
+**Verify**
+
+- [x] Approving a step leaves a clean working tree — `.pi/plan-state.json` is included in the step commit, not left dirty afterward
+- [x] The step commit contains both the step's code changes and the advanced `currentStep` / `completedSteps` in `.pi/plan-state.json`
+- [x] Reject and tweak paths are unchanged (no state write, no commit)
+
+**Notes**
+
+- This depends on pi-lens formatting being settled before `finish_step` runs. Use deferred-safe setup: in `~/.pi-lens/config.json`, set `"format": { "mode": "immediate" }` so format does not run at `agent_end` after the commit. That config is user-owned; this package does not write or enforce it.
+- Step 4's "re-read before write" requirement still applies — only the relative order vs git commit changes (write state, then commit).
+
+---
+
+#### Step 10 — Enable pi-lens immediate format in global lens config
+
+**Recipe**
+
+1. Open `~/.pi-lens/config.json` (create it if missing).
+2. Set format mode to immediate so files are formatted after each write/edit instead of at `agent_end` after `finish_step` commits:
+
+```json
+{
+  "format": {
+    "mode": "immediate"
+  }
+}
+```
+
+3. Merge with any existing keys in that file; do not wipe unrelated lens settings.
+
+**Verify**
+
+- [ ] `~/.pi-lens/config.json` contains `"format": { "mode": "immediate" }`
+- [ ] After a write/edit in a Pi session with pi-lens loaded, formatting lands before the next tool call (not deferred until after `finish_step`)
+
+**Notes**
+
+- This is user-global lens config, not project settings and not `~/.pi/agent/settings.json`.
+- Complements Step 9: immediate format prevents post-commit style churn; Step 9 prevents `plan-state.json` from hanging dirty after approve.
+
+---
+
 ## Phase 2 (Future)
 
 - Surface a `--show-archived` flag on `/activate-plan` to list plans in `docs/plans/reference/` and optionally restore one

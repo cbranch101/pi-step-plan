@@ -324,30 +324,18 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Approve ───────────────────────────────────────────────────────────
-      await pi.exec("git", ["add", "-A"]);
-      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
-
-      if (code !== 0 && !stderr.includes("nothing to commit")) {
-        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
-        return {
-          content: [{ type: "text", text: `Git commit failed: ${stderr}. Do not proceed.` }],
-          details: undefined,
-        };
-      }
-
-      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
-
-      // Re-read state after commit to avoid stale-state overwrites
+      // Re-read state before writing to avoid stale-state overwrites, then
+      // advance plan progress so .pi/plan-state.json is included in the commit.
       const state = await readState(ctx.cwd);
       const planPath = state.activePlan;
 
       if (!planPath || !state.plans[planPath]) {
-        ctx.ui.notify("State is inconsistent: no active plan found after commit.", "error");
+        ctx.ui.notify("State is inconsistent: no active plan found.", "error");
         return {
           content: [
             {
               type: "text",
-              text: "State is inconsistent: activePlan is null or missing from plans map. currentStep was not updated. Do not proceed.",
+              text: "State is inconsistent: activePlan is null or missing from plans map. currentStep was not updated and no commit was made. Do not proceed.",
             },
           ],
           details: undefined,
@@ -361,7 +349,20 @@ export default function (pi: ExtensionAPI) {
       }
       progress.currentStep = stepNumber + 1;
       await writeState(ctx.cwd, state);
+
+      await pi.exec("git", ["add", "-A"]);
+      const { code, stderr } = await pi.exec("git", ["commit", "-m", commitMsg]);
+
+      if (code !== 0 && !stderr.includes("nothing to commit")) {
+        ctx.ui.notify(`git commit failed: ${stderr}`, "error");
+        return {
+          content: [{ type: "text", text: `Git commit failed: ${stderr}. Do not proceed.` }],
+          details: undefined,
+        };
+      }
+
       activeStepNumber = null;
+      ctx.ui.notify(`Committed: ${commitMsg}`, "info");
 
       return {
         content: [
