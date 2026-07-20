@@ -2,8 +2,10 @@ import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ApprovalComponent } from "./approval-component.js";
 import type { ApprovalAction } from "./approval-component.js";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { copyFile, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // ─── Embedded plan doc template ───────────────────────────────────────────────
@@ -179,7 +181,57 @@ function findStepByNumber(content: string, stepNumber: number): ActiveStep | nul
   return null;
 }
 
-// ─── Extension ────────────────────────────────────────────────────────────────
+// ─── PR review comment helpers ───────────────────────────────────────────────
+
+interface ParsedCommentLines {
+  line: number;
+  start_line?: number;
+}
+
+/** Parse `"42"` or `"42-58"` (inclusive) into GitHub review line / start_line. */
+function parseCommentLines(lines: string): ParsedCommentLines | { error: string } {
+  const trimmed = lines.trim();
+  const single = /^(\d+)$/.exec(trimmed);
+  if (single) {
+    const line = parseInt(single[1]!, 10);
+    if (line < 1) return { error: `Invalid lines "${lines}": line must be >= 1` };
+    return { line };
+  }
+  const range = /^(\d+)-(\d+)$/.exec(trimmed);
+  if (range) {
+    const start = parseInt(range[1]!, 10);
+    const end = parseInt(range[2]!, 10);
+    if (start < 1 || end < 1) {
+      return { error: `Invalid lines "${lines}": line numbers must be >= 1` };
+    }
+    if (start > end) {
+      return { error: `Invalid lines "${lines}": start must be <= end` };
+    }
+    if (start === end) return { line: start };
+    return { start_line: start, line: end };
+  }
+  return { error: `Invalid lines "${lines}": expected "N" or "N-M" (e.g. "42" or "42-58")` };
+}
+
+interface PrCommentInput {
+  body: string;
+  path: string;
+  lines: string;
+}
+
+function formatPrDraftForConfirm(
+  title: string,
+  body: string,
+  comments: PrCommentInput[],
+): string {
+  const commentBlock =
+    comments.length === 0
+      ? "(none)"
+      : comments
+          .map((c, i) => `${i + 1}. ${c.path}:${c.lines}\n   ${c.body}`)
+          .join("\n\n");
+  return `Title: ${title}\n\nBody:\n${body}\n\nComments (${comments.length}):\n${commentBlock}`;
+}
 
 // ─── Notifications ───────────────────────────────────────────────────────────
 
@@ -579,30 +631,80 @@ export default function (pi: ExtensionAPI) {
     label: "Create Pull Request",
     description:
       "Call this after the cleanup commit during /plan-close. " +
-      "Submit the drafted PR title, body, and the issue numbers returned by create_github_issues. " +
-      "The extension will inject 'closes #N' lines for each issue number, then handle confirmation and creation via gh. " +
-      "Do NOT run gh commands directly. If the tool returns feedback, revise and call this tool again.",
+      "Submit the drafted PR title, structured body, issue numbers from create_github_issues, " +
+      "and optional line-anchored review comments (path + lines + body). " +
+      "The extension injects 'closes #N', shows one confirmation for the whole package, then creates the PR and posts one COMMENT review with the inline comments. " +
+      "Do NOT run gh commands directly. If the tool returns feedback, revise title/body/comments and call again. " +
+      "If PR creation succeeded but review posting failed, call again with the same (or revised) comments to retry the review only — do not open a second PR.",
     parameters: Type.Object({
       title: Type.String({ description: "PR title" }),
-      body: Type.String({ description: "PR body describing what this PR does" }),
+      body: Type.String({
+        description:
+          "PR body using sections: Goal, Concepts & decisions, Systems, Test plan. Do not include closes #N — the extension injects those.",
+      }),
       issueNumbers: Type.Array(Type.Number(), {
         description:
           "GitHub issue numbers to close with this PR — pass the numbers returned by create_github_issues. Pass an empty array if no issues were created.",
       }),
+      comments: Type.Array(
+        Type.Object({
+          body: Type.String({ description: "Inline review comment body" }),
+          path: Type.String({ description: "File path relative to repo root, as in the PR diff" }),
+          lines: Type.String({
+            description:
+              'Target line(s) in the new file (RIGHT side): "42" for a single line, or "42-58" for an inclusive range',
+          }),
+        }),
+        {
+          description:
+            "Line-anchored review comments for pushback-prone hunks. Pass an empty array if none.",
+        },
+      ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       const issueNumbers: number[] = params.issueNumbers;
+      const comments: PrCommentInput[] = params.comments;
+
+      // Validate comments.lines before any UI or gh side effects
+      const parsedComments: Array<{
+        body: string;
+        path: string;
+        lines: string;
+        line: number;
+        start_line?: number;
+      }> = [];
+      for (const comment of comments) {
+        const parsed = parseCommentLines(comment.lines);
+        if ("error" in parsed) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${parsed.error}. Fix the lines field and call create_pull_request again.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+        parsedComments.push({
+          body: comment.body,
+          path: comment.path,
+          lines: comment.lines.trim(),
+          line: parsed.line,
+          start_line: parsed.start_line,
+        });
+      }
 
       const closesLines =
         issueNumbers.length > 0 ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n") : "";
-
       const fullBody = params.body + closesLines;
+      const draftText = formatPrDraftForConfirm(params.title, fullBody, parsedComments);
 
-      const confirmed = await ctx.ui.confirm(`Create this PR: "${params.title}"?`, fullBody);
+      const confirmed = await ctx.ui.confirm(`Create this PR: "${params.title}"?`, draftText);
 
       if (!confirmed) {
         const feedback = await ctx.ui.input(
-          "What do you want to change about the PR? (leave blank to cancel)",
+          "What do you want to change about the PR title, body, or comments? (leave blank to cancel)",
         );
         if (feedback?.trim()) {
           return {
@@ -611,7 +713,7 @@ export default function (pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `User declined the PR with feedback: ${feedback.trim()}. ` +
-                  `Please revise the title and/or body and call create_pull_request again.`,
+                  `Please revise the title, body, and/or comments and call create_pull_request again.`,
               },
             ],
             details: undefined,
@@ -623,29 +725,78 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      let ghOutput: string;
+      // Resolve existing PR on this branch (retry path after review failure) or create one
+      let prUrl: string;
+      let prNumber: number;
+      let headSha: string;
+      let createdFresh = false;
+
       try {
-        const { code, stdout, stderr } = await pi.exec("gh", [
+        const existing = await pi.exec("gh", [
           "pr",
-          "create",
-          "--title",
-          params.title,
-          "--body",
-          fullBody,
+          "view",
+          "--json",
+          "number,url,headRefOid",
         ]);
-        if (code !== 0) {
-          ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
-          return {
-            content: [
-              {
-                type: "text",
-                text: `gh pr create failed: ${stderr}. Do not proceed.`,
-              },
-            ],
-            details: undefined,
+        if (existing.code === 0 && existing.stdout.trim()) {
+          const data = JSON.parse(existing.stdout) as {
+            number: number;
+            url: string;
+            headRefOid: string;
           };
+          prUrl = data.url;
+          prNumber = data.number;
+          headSha = data.headRefOid;
+        } else {
+          const { code, stdout, stderr } = await pi.exec("gh", [
+            "pr",
+            "create",
+            "--title",
+            params.title,
+            "--body",
+            fullBody,
+          ]);
+          if (code !== 0) {
+            ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `gh pr create failed: ${stderr}. Do not proceed.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+          prUrl = stdout.trim();
+          createdFresh = true;
+
+          const view = await pi.exec("gh", [
+            "pr",
+            "view",
+            prUrl,
+            "--json",
+            "number,headRefOid",
+          ]);
+          if (view.code !== 0) {
+            ctx.ui.notify(`PR created but failed to resolve metadata: ${view.stderr}`, "error");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Pull request created: ${prUrl}\n` +
+                    `Failed to resolve PR number / head SHA for review posting: ${view.stderr}. ` +
+                    `Call create_pull_request again with the same (or revised) comments to retry the review only — do not create another PR.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+          const meta = JSON.parse(view.stdout) as { number: number; headRefOid: string };
+          prNumber = meta.number;
+          headSha = meta.headRefOid;
         }
-        ghOutput = stdout.trim();
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`gh not available: ${msg}`, "error");
@@ -660,12 +811,103 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      ctx.ui.notify(`PR created: ${ghOutput}`, "info");
+      if (parsedComments.length === 0) {
+        ctx.ui.notify(`PR ${createdFresh ? "created" : "ready"}: ${prUrl}`, "info");
+        return {
+          content: [
+            {
+              type: "text",
+              text: createdFresh
+                ? `Pull request created successfully: ${prUrl}`
+                : `Pull request already exists: ${prUrl}. No review comments to post.`,
+            },
+          ],
+          details: undefined,
+        };
+      }
+
+      // Post one pull-request review with all inline comments
+      const reviewPayload = {
+        commit_id: headSha,
+        event: "COMMENT",
+        comments: parsedComments.map((c) => {
+          const entry: {
+            path: string;
+            body: string;
+            side: "RIGHT";
+            line: number;
+            start_line?: number;
+            start_side?: "RIGHT";
+          } = {
+            path: c.path,
+            body: c.body,
+            side: "RIGHT",
+            line: c.line,
+          };
+          if (c.start_line !== undefined) {
+            entry.start_line = c.start_line;
+            entry.start_side = "RIGHT";
+          }
+          return entry;
+        }),
+      };
+
+      const reviewPath = join(tmpdir(), `pi-pr-review-${randomUUID()}.json`);
+      try {
+        await writeFile(reviewPath, JSON.stringify(reviewPayload), "utf8");
+        const { code, stderr } = await pi.exec("gh", [
+          "api",
+          "--method",
+          "POST",
+          `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
+          "--input",
+          reviewPath,
+        ]);
+        if (code !== 0) {
+          ctx.ui.notify(`PR created but review failed: ${stderr}`, "error");
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Pull request ${createdFresh ? "created" : "exists"}: ${prUrl}\n` +
+                  `Posting the review comments failed: ${stderr}\n` +
+                  `Call create_pull_request again with the same (or revised) comments to retry the review only — do not create another PR.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`PR created but review failed: ${msg}`, "error");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Pull request ${createdFresh ? "created" : "exists"}: ${prUrl}\n` +
+                `Posting the review comments failed: ${msg}\n` +
+                `Call create_pull_request again with the same (or revised) comments to retry the review only — do not create another PR.`,
+            },
+          ],
+          details: undefined,
+        };
+      } finally {
+        await unlink(reviewPath).catch(() => {});
+      }
+
+      ctx.ui.notify(
+        `PR ${createdFresh ? "created" : "updated"} with ${parsedComments.length} review comment(s): ${prUrl}`,
+        "info",
+      );
       return {
         content: [
           {
             type: "text",
-            text: `Pull request created successfully: ${ghOutput}`,
+            text: createdFresh
+              ? `Pull request created successfully: ${prUrl} (${parsedComments.length} review comment(s) posted).`
+              : `Review comments posted on existing PR: ${prUrl} (${parsedComments.length} comment(s)).`,
           },
         ],
         details: undefined,
@@ -1037,9 +1279,30 @@ export default function (pi: ExtensionAPI) {
           `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
           `3. Make those updates now using the write and edit tools.\n` +
           `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
-          `5. After committing, draft a pull request title and a concise body describing what this plan accomplished. ` +
-          `Then call the \`create_pull_request\` tool with the draft title, body, and the issue numbers listed below. ` +
-          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
+          `5. After committing, draft a pull request and call \`create_pull_request\`.\n\n` +
+          `## PR body template (required)\n\n` +
+          `Use exactly these sections. Detail is welcome in Goal and Concepts & decisions; keep Systems and Test plan tighter:\n\n` +
+          `### Goal\n` +
+          `Overview of what this PR delivers and why it matters — enough context that a reviewer who has not read the plan can orient (not limited to 1–2 sentences).\n\n` +
+          `### Concepts & decisions\n` +
+          `Substantive design story drawn from the plan Decision Log / Architecture deltas. ` +
+          `Each decision may be multi-paragraph (rationale, tradeoff, alternatives when relevant). ` +
+          `Do not dump the full plan or step recipes.\n\n` +
+          `### Systems\n` +
+          `Major modules/commands/tools involved and their role (not a file list).\n\n` +
+          `### Test plan\n` +
+          `2–4 behavioral checks worth running.\n\n` +
+          `Exclude from the body: commit-by-commit narrative, file walkthroughs. ` +
+          `Do not include \`closes #N\` — the extension injects those from \`issueNumbers\`.\n\n` +
+          `## Review comments (optional)\n\n` +
+          `Pass \`comments\` as an array of \`{ body, path, lines }\` for pushback-prone points that belong on a specific hunk. ` +
+          `\`lines\` is \`"42"\` (single line) or \`"42-58"\` (inclusive range) on the new-file side of the diff. ` +
+          `Heuristic: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren't. ` +
+          `Skip routine mechanics and anything that cannot be anchored to a diff hunk. ` +
+          `Pass an empty array if there are no such comments.\n\n` +
+          `Then call \`create_pull_request\` with title, body, issueNumbers, and comments. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
+          `If the tool reports that the PR was created but review posting failed, call \`create_pull_request\` again with the same (or revised) comments to retry the review only — do not open a second PR.\n\n` +
           `${issueNumbersNote}\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,

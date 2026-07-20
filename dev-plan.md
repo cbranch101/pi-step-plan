@@ -205,9 +205,16 @@ create_github_issues    — agent submits fully drafted issues for per-issue app
   input: { issues: Array<{ title: string; body: string }> }
   must only be called after review_issue_outline has been approved
 
-create_pull_request     — agent submits drafted PR title/body for user approval then gh creation
-  input: { title: string; body: string }
-  extension injects: "closes #N" for each stored issue number before showing to user
+create_pull_request     — agent submits drafted PR title/body and line-anchored review comments for one approval gate, then gh creation + review posting
+  input: {
+    title: string;
+    body: string;
+    issueNumbers: number[];
+    comments: Array<{ body: string; path: string; lines: string }>
+  }
+  lines format: "42" (single line) or "42-58" (inclusive range); tool parses into GitHub start_line/line
+  extension injects: "closes #N" for each issue number before showing to user
+  on approve: create PR, then post one pull-request review with the inline comments via gh api
 ```
 
 **Updated state shape (`.pi/plan-state.json`):**
@@ -444,13 +451,41 @@ create_pull_request     — agent submits drafted PR title/body for user approva
 
 **Verify**
 
-- [ ] `~/.pi-lens/config.json` contains `"format": { "mode": "immediate" }`
+- [x] `~/.pi-lens/config.json` contains `"format": { "mode": "immediate" }`
 - [ ] After a write/edit in a Pi session with pi-lens loaded, formatting lands before the next tool call (not deferred until after `finish_step`)
 
 **Notes**
 
 - This is user-global lens config, not project settings and not `~/.pi/agent/settings.json`.
 - Complements Step 9: immediate format prevents post-commit style churn; Step 9 prevents `plan-state.json` from hanging dirty after approve.
+
+---
+
+#### Step 11 — Structured PR body + line-anchored review comments
+
+**Recipe**
+
+1. Update the `/plan-close` agent prompt so PR drafting follows a fixed body template — detail is welcome in Goal and Concepts & decisions; keep Systems and Test plan tighter:
+   - **Goal** — overview of what this PR delivers and why it matters; enough context that a reviewer who has not read the plan can orient (not limited to 1–2 sentences).
+   - **Concepts & decisions** — substantive design story drawn from the plan Decision Log / Architecture deltas; each decision may be multi-paragraph (rationale, tradeoff, alternatives when relevant). Do not dump the full plan or step recipes.
+   - **Systems** — major modules/commands/tools involved and their role (not a file list).
+   - **Test plan** — 2–4 behavioral checks worth running.
+   Exclude: commit-by-commit narrative, file walkthroughs. Pushback-prone points that belong on a specific hunk go in `comments`, not the body.
+2. Extend `create_pull_request` with `comments: Array<{ body: string; path: string; lines: string }>` (empty array allowed). `lines` is `"42"` or `"42-58"` (inclusive); the tool parses that into GitHub `line` / `start_line` and rejects invalid forms. Before any `gh` call, show one confirmation with title, full body (with injected `closes #N`), and each planned comment as `path:lines` + body. On decline with feedback, return it so the agent can revise title/body/comments and call again.
+3. On approval: run `gh pr create`, resolve PR number + head commit SHA, then post **one** pull-request review (`event: COMMENT`, `side: RIGHT`) via `gh api` with all inline comments. Comments must target lines present in the PR diff. If PR creation succeeds but the review fails, return the PR URL and the error; instruct the agent to retry only the review/comments (do not recreate the PR). Heuristic for comments: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren’t — skip routine mechanics and anything that cannot be anchored to a diff hunk.
+
+**Verify**
+
+- [x] After `/plan-close`, the PR draft shown for approval uses the Goal / Concepts & decisions / Systems / Test plan structure
+- [x] The approval UI shows each line-anchored comment (`path` + `lines` + body) alongside title and body; approving creates the PR and attaches those comments on the diff
+- [x] Approving with an empty comments list still creates the PR successfully
+- [x] If review posting fails after PR creation, the tool reports the PR URL and error and the agent can retry comments without opening a second PR
+
+**Notes**
+
+- Body = detailed orientation map; comments = line-anchored pushback flags only. Untethered/top-level PR comments are out of scope.
+- One approval covers the whole package before any GitHub side effects.
+- Step 3/8 remain the base `create_pull_request` implementation; this step replaces the vague “concise body” prompt and adds structured body guidance plus anchored `comments`.
 
 ---
 
