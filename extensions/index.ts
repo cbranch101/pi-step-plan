@@ -829,7 +829,7 @@ export default function (pi: ExtensionAPI) {
           "pr",
           "view",
           "--json",
-          "number,url,state,headRefName,merged",
+          "number,url,state,headRefName,mergedAt",
         ]);
 
         if (code !== 0) {
@@ -845,7 +845,7 @@ export default function (pi: ExtensionAPI) {
           url: string;
           state: string;
           headRefName: string;
-          merged: boolean;
+          mergedAt: string | null;
         };
 
         return {
@@ -1590,7 +1590,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Check whether the PR has been merged before doing anything
-      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "state,merged,url"]);
+      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "state,mergedAt,url"]);
 
       if (prCheck.code !== 0) {
         ctx.ui.notify(`No PR found for branch '${branch}'. Run /plan-submit first.`, "warning");
@@ -1602,10 +1602,10 @@ export default function (pi: ExtensionAPI) {
       try {
         const prData = JSON.parse(prCheck.stdout) as {
           state: string;
-          merged: boolean;
+          mergedAt: string | null;
           url: string;
         };
-        prMerged = prData.merged;
+        prMerged = prData.mergedAt !== null;
         prUrl = prData.url;
       } catch {
         ctx.ui.notify("Failed to parse PR metadata from gh output.", "error");
