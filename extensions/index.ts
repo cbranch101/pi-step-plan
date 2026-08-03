@@ -281,7 +281,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   let planMode = false;
-  let revisePlanPath: string | null = null; // non-null when entered via /revise-plan
   let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
@@ -289,8 +288,8 @@ export default function (pi: ExtensionAPI) {
     name: "finish_step",
     label: "Finish Step",
     description:
-      "Call this ONLY when you have been explicitly dispatched a step via /next-step or /resume-step and have finished implementing it. " +
-      "Do NOT call this during normal conversations, bug fixes, or any work outside of an active plan step. " +
+      "Call this ONLY when you have been explicitly dispatched a step via /next-step and have finished implementing it. " +
+      "Do NOT call this during normal conversations, bug fixes, or any work outside of an active plan step dispatch. " +
       "Write a conventional commit message summarising exactly what you changed.",
     parameters: Type.Object({
       commitMessage: Type.String({
@@ -299,13 +298,13 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      // Guard: only callable when a step was explicitly dispatched via /next-step or /resume-step
+      // Guard: only callable when a step was explicitly dispatched via /next-step
       if (activeStepNumber === null) {
         return {
           content: [
             {
               type: "text",
-              text: "finish_step was called outside of an active step dispatch. No /next-step or /resume-step has been run in this session. Do not commit or modify state — stop and wait for user instructions.",
+              text: "finish_step was called outside of an active step dispatch. No /next-step has been run in this session. Do not commit or modify state — stop and wait for user instructions.",
             },
           ],
           details: undefined,
@@ -630,6 +629,171 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── update_github_issues tool — agent calls this during /modify-plan-finish ──
+  pi.registerTool({
+    name: "update_github_issues",
+    label: "Update GitHub Issues",
+    description:
+      "Call this after the plan doc has been modified during /modify-plan-finish. " +
+      "Submit proposed edits to existing GitHub issues for user review; the extension will handle confirmation and update via gh. " +
+      "Do NOT run gh commands directly. " +
+      "Only issue numbers stored in the plan's githubIssues list are eligible — do NOT pass arbitrary issue numbers. " +
+      "If the tool returns feedback for any issue, revise that issue and call this tool again.",
+    parameters: Type.Object({
+      issues: Type.Array(
+        Type.Object({
+          number: Type.Number({ description: "Existing GitHub issue number" }),
+          title: Type.Optional(Type.String({ description: "New title (omit to leave unchanged)" })),
+          body: Type.Optional(Type.String({ description: "New body (omit to leave unchanged)" })),
+        }),
+        { description: "Proposed edits to present for user review" },
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+
+      if (!planPath || !state.plans[planPath]) {
+        return {
+          content: [
+            { type: "text", text: "No active plan found in state. Cannot update GitHub issues." },
+          ],
+          details: undefined,
+        };
+      }
+
+      const allowedNumbers = state.plans[planPath].githubIssues ?? [];
+
+      // Validate all issue numbers before any UI or gh side effects
+      for (const issue of params.issues) {
+        if (!allowedNumbers.includes(issue.number)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Issue #${issue.number} is not in the githubIssues list for this plan ([${allowedNumbers.join(", ")}]). ` +
+                  `Do not pass arbitrary issue numbers — only numbers returned by create_github_issues for this plan are eligible.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+      }
+
+      const updatedNumbers: number[] = [];
+      const feedbackItems: string[] = [];
+
+      for (const issue of params.issues) {
+        // Fetch current title and body for diff display
+        let currentTitle = "(unknown)";
+        let currentBody = "(unknown)";
+        try {
+          const { code, stdout } = await pi.exec("gh", [
+            "issue",
+            "view",
+            String(issue.number),
+            "--json",
+            "title,body",
+          ]);
+          if (code === 0) {
+            const data = JSON.parse(stdout) as { title: string; body: string };
+            currentTitle = data.title;
+            currentBody = data.body;
+          }
+        } catch {
+          // Continue with unknown placeholders
+        }
+
+        const diffLines: string[] = [`Issue #${issue.number}`];
+        if (issue.title !== undefined) {
+          diffLines.push(`\nTitle:\n  old: ${currentTitle}\n  new: ${issue.title}`);
+        }
+        if (issue.body !== undefined) {
+          diffLines.push(`\nBody:\n  old:\n${currentBody}\n\n  new:\n${issue.body}`);
+        }
+
+        const confirmed = await ctx.ui.confirm(
+          `Update issue #${issue.number}?`,
+          diffLines.join(""),
+        );
+
+        if (confirmed) {
+          const ghArgs = ["issue", "edit", String(issue.number)];
+          if (issue.title !== undefined) {
+            ghArgs.push("--title", issue.title);
+          }
+          if (issue.body !== undefined) {
+            ghArgs.push("--body", issue.body);
+          }
+
+          try {
+            const { code, stderr } = await pi.exec("gh", ghArgs);
+            if (code !== 0) {
+              ctx.ui.notify(`gh issue edit failed: ${stderr}`, "error");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `gh issue edit failed for #${issue.number}: ${stderr}. Do not proceed with remaining issues.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.ui.notify(`gh not available: ${msg}`, "error");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `gh is not installed or not authenticated: ${msg}. Cannot update issues.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+
+          updatedNumbers.push(issue.number);
+          ctx.ui.notify(`Updated issue #${issue.number}`, "info");
+        } else {
+          const feedback = await ctx.ui.input(
+            `Any feedback on issue #${issue.number}? (leave blank to skip)`,
+          );
+          if (feedback?.trim()) {
+            feedbackItems.push(`- #${issue.number}: ${feedback.trim()}`);
+          }
+        }
+      }
+
+      const updatedSummary =
+        updatedNumbers.length > 0
+          ? `Updated ${updatedNumbers.length} issue(s): ${updatedNumbers.map((n) => `#${n}`).join(", ")}.`
+          : "No issues were updated.";
+
+      if (feedbackItems.length > 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${updatedSummary}\n\n` +
+                `The following issues were declined with feedback — please revise them and call update_github_issues again:\n` +
+                feedbackItems.join("\n"),
+            },
+          ],
+          details: undefined,
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: updatedSummary }],
+        details: undefined,
+      };
+    },
+  });
+
   // ── create_pull_request tool — agent calls this after /plan-close commit ────
   pi.registerTool({
     name: "create_pull_request",
@@ -726,6 +890,21 @@ export default function (pi: ExtensionAPI) {
         }
         return {
           content: [{ type: "text", text: "PR creation cancelled by user." }],
+          details: undefined,
+        };
+      }
+
+      // Push current branch before attempting PR creation
+      const push = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
+      if (push.code !== 0) {
+        ctx.ui.notify(`git push failed: ${push.stderr}`, "error");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `git push failed: ${push.stderr}. Resolve the push issue and call create_pull_request again.`,
+            },
+          ],
           details: undefined,
         };
       }
@@ -918,18 +1097,15 @@ export default function (pi: ExtensionAPI) {
       const inputPath = (event.input as { path?: string }).path;
       if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
 
-      const exitCmd = revisePlanPath ? "/resume-step" : "/plan-finish";
       ctx.ui.notify(
-        `⏸ Plan mode: \`${event.toolName}\` blocked. Use ${exitCmd} to exit planning.`,
+        `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
         "warning",
       );
       return {
         block: true,
-        reason: revisePlanPath
-          ? "Plan revision mode is active. write and edit are disabled outside of docs/. " +
-            "Edit docs only — no implementation. Run /resume-step when done."
-          : "Plan mode is active. write and edit are disabled outside of docs/. " +
-            "Discuss and plan only — no implementation. Run /plan-finish when done.",
+        reason:
+          "Plan mode is active. write and edit are disabled outside of docs/. " +
+          "Discuss and plan only — no implementation. Run /plan-finish when done.",
       };
     }
   });
@@ -937,24 +1113,6 @@ export default function (pi: ExtensionAPI) {
   // ── Inject system prompt addition in plan mode ──────────────────────────────
   pi.on("before_agent_start", (event) => {
     if (!planMode) return;
-
-    if (revisePlanPath) {
-      return {
-        systemPrompt:
-          event.systemPrompt +
-          `\n\n## ⏸ PLAN REVISION MODE ACTIVE\n` +
-          `Step execution is paused. Your ONLY job right now is to discuss and revise the plan doc.\n` +
-          `\n` +
-          `**You must NOT:**\n` +
-          `- Call write or edit on any file outside the docs/ directory\n` +
-          `- Implement any code\n` +
-          `\n` +
-          `**You MUST:**\n` +
-          `- Discuss what needs to change with the user\n` +
-          `- Edit the plan doc directly when changes are agreed upon\n` +
-          `- Stay in revision mode until the user runs /resume-step\n`,
-      };
-    }
 
     return {
       systemPrompt:
@@ -1028,9 +1186,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /revise-plan ─────────────────────────────────────────────────────────────
-  pi.registerCommand("revise-plan", {
-    description: "Pause step execution and enter planning mode to revise the active plan",
+  // ── /modify-plan-start ─────────────────────────────────────────────────────
+  pi.registerCommand("modify-plan-start", {
+    description: "Load the active plan and set the agent up to modify future steps",
     handler: async (_args, ctx) => {
       const state = await readState(ctx.cwd);
 
@@ -1041,7 +1199,17 @@ export default function (pi: ExtensionAPI) {
 
       const planPath = state.activePlan;
       const progress = state.plans[planPath];
-      const stepNumber = progress?.currentStep ?? 1;
+      const currentStep = progress?.currentStep ?? 1;
+
+      // Warn if plan file has uncommitted changes
+      const { stdout: diffOutput } = await pi.exec("git", ["diff", "HEAD", "--", planPath]);
+      if (diffOutput.trim()) {
+        ctx.ui.notify(
+          `⚠️ The plan file (${planPath}) has uncommitted changes. ` +
+            `These may be lost or cause conflicts. Consider committing or reverting before modifying.`,
+          "warning",
+        );
+      }
 
       let planContent: string;
       try {
@@ -1051,31 +1219,35 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      planMode = true;
-      revisePlanPath = planPath;
-
       ctx.ui.notify(
-        `⏸ Revise mode enabled. Execution of step ${stepNumber} paused.\n` +
-          `Only edits to the plan file are allowed. Run /resume-step when done.`,
+        `Loading plan for modification. Current step: ${currentStep}. Steps 1–${currentStep} are locked; non-step sections are freely editable.`,
         "info",
       );
 
       pi.sendUserMessage(
-        `Execution of **Step ${stepNumber}** is paused for plan revision.\n\n` +
-          `Here is the current plan:\n\n${planContent}\n\n` +
-          `Tell the user you are ready to discuss changes and ask what they want to change. Do not analyze the plan or suggest changes yourself.`,
+        `You are being asked to help the user modify the active plan. Here is the current plan:\n\n` +
+          `${planContent}\n\n` +
+          `---\n\n` +
+          `## Modification fence\n\n` +
+          `The current step is **Step ${currentStep}**. ` +
+          `All non-step sections of the plan (Project Summary, Goals, Architecture, Constraints, Interfaces, Dependencies, Risks, Decision Log, etc.) are freely editable. ` +
+          `Within the Steps section, Steps 1 through ${currentStep} (inclusive) are **locked** — they must not be modified under any circumstances. ` +
+          `Only steps strictly after Step ${currentStep} may be changed.\n\n` +
+          `## Your task\n\n` +
+          `Ask the user what changes they would like to make to the plan. ` +
+          `Do not propose changes yourself or analyze the plan unprompted. ` +
+          `Once the user describes what they want, help them make those changes (updating non-step sections freely, and only touching steps after Step ${currentStep}). ` +
+          `When the modifications are complete, the user will run \`/modify-plan-finish\` to trigger the consistency check, approval loop, commit, and issue updates.`,
         { deliverAs: "followUp" },
       );
     },
   });
 
-  // ── /resume-step ─────────────────────────────────────────────────────────────
-  pi.registerCommand("resume-step", {
-    description: "Exit plan revision mode and resume execution of the current step",
+  // ── /modify-plan-finish ───────────────────────────────────────────────────
+  pi.registerCommand("modify-plan-finish", {
+    description:
+      "Trigger forward consistency check, approval loop, commit, and issue updates after plan modification",
     handler: async (_args, ctx) => {
-      planMode = false;
-      revisePlanPath = null;
-
       const state = await readState(ctx.cwd);
 
       if (!state.activePlan) {
@@ -1084,53 +1256,40 @@ export default function (pi: ExtensionAPI) {
       }
 
       const planPath = state.activePlan;
-      const progress = state.plans[planPath] ?? { currentStep: 1, completedSteps: [] };
-      const stepNumber = progress.currentStep;
+      const progress = state.plans[planPath];
+      const currentStep = progress?.currentStep ?? 1;
+      const githubIssues = progress?.githubIssues ?? [];
 
-      let planContent: string;
-      try {
-        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
-      } catch {
-        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
-        return;
-      }
+      const issueSection =
+        githubIssues.length > 0
+          ? `## GitHub issue updates\n\n` +
+            `The following GitHub issues were created for this plan: [${githubIssues.map((n) => `#${n}`).join(", ")}]. ` +
+            `For each issue, run \`gh issue view <number>\` to read its current content. ` +
+            `Identify any issues affected by the plan changes and call \`update_github_issues\` with proposed edits. ` +
+            `Do NOT run \`gh issue edit\` directly — only the tool is allowed to do that.`
+          : `## GitHub issue updates\n\nNo GitHub issues were created for this plan — skip this step.`;
 
-      const step = findStepByNumber(planContent, stepNumber);
-      if (!step) {
-        ctx.ui.notify(`Step ${stepNumber} not found in ${planPath}.`, "error");
-        return;
-      }
+      ctx.ui.notify(
+        `Running /modify-plan-finish for plan: ${planPath} (current step: ${currentStep})`,
+        "info",
+      );
 
-      const { stdout: diff } = await pi.exec("git", ["diff", "HEAD"]);
-
-      const diffSection = diff.trim()
-        ? `## Partial work already done on this step\n\nThe following changes were made before the plan was revised:\n\n\`\`\`diff\n${diff}\n\`\`\``
-        : `## Partial work\n\nNo changes have been made yet on this step.`;
-
-      ctx.ui.notify(`Resuming Step ${stepNumber}: ${step.title}`, "info");
-
-      activeStepNumber = step.number;
-
-      const message =
-        `## Updated Plan\n\n${planContent}\n\n---\n\n` +
-        `${diffSection}\n\n---\n\n` +
-        `## Your task\n\n` +
-        `Continue implementing **Step ${stepNumber} — ${step.title}**.\n\n` +
-        `Step content:\n\n${step.body}\n\n` +
-        `Use the full plan for context, constraints, contracts, and sequencing, but treat only Step ${stepNumber} as authorization to change code. ` +
-        `Implement exactly the active Step Recipe and satisfy its Verify criteria. ` +
-        `Do not add behavior, files, routes, APIs, abstractions, dependencies, UI, tests, or docs beyond what this Step requires. ` +
-        `Do not pre-build later Steps, round out the product, or fill gaps with inferred product/design decisions. ` +
-        `If the Step is underspecified or appears to require out-of-step work, stop and ask. ` +
-        `Take into account both the updated plan and the partial work already done above. ` +
-        `Complete the step, then call the \`finish_step\` tool with a conventional commit message. ` +
-        `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
-
-      pi.sendUserMessage(message, { deliverAs: "followUp" });
+      pi.sendUserMessage(
+        `The plan modification session is complete. Please do the following now:\n\n` +
+          `1. **Forward consistency check**: Scan all steps after the earliest modified step through the end of the plan. ` +
+          `Verify that each step is still internally consistent and consistent with the changes made. ` +
+          `Update any steps that are out of sync with the modifications.\n\n` +
+          `2. **User approval**: Present the full set of proposed changes (both the modifications and any consistency updates) to the user for approval. ` +
+          `Incorporate any feedback and loop until the user explicitly approves the final plan.\n\n` +
+          `3. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
+          `(replace \`<short reason>\` with a concise description of what was changed, e.g. "add retry logic to step 4").\n\n` +
+          issueSection,
+        { deliverAs: "followUp" },
+      );
     },
   });
 
-  // ── /activate-plan ──────────────────────────────────────────────────────────
+  // ── /activate-plan ─────────────────────────────────────────────────────────
   pi.registerCommand("activate-plan", {
     description: "Select a plan from docs/plans/ and set it as the active plan",
     handler: async (_args, ctx) => {
