@@ -1568,7 +1568,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /plan-close ──────────────────────────────────────────────────────────────
   pi.registerCommand("plan-close", {
-    description: "Finalize the active plan: update relevant repo files and commit",
+    description: "Archive the active plan — only runs after the PR has been merged",
     handler: async (_args, ctx) => {
       const state = await readState(ctx.cwd);
 
@@ -1578,62 +1578,49 @@ export default function (pi: ExtensionAPI) {
       }
 
       const planPath = state.activePlan;
+      const branch = state.plans[planPath]?.branch ?? "(unknown)";
 
       let planContent: string;
       try {
         planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+        void planContent; // read only to confirm file exists
       } catch {
         ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
         return;
       }
 
-      ctx.ui.notify(`Closing plan: ${planPath}`, "info");
+      // Check whether the PR has been merged before doing anything
+      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "state,merged,url"]);
 
-      const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
-      const commitMsg = `plan-close: ${planName}`;
+      if (prCheck.code !== 0) {
+        ctx.ui.notify(`No PR found for branch '${branch}'. Run /plan-submit first.`, "warning");
+        return;
+      }
 
-      const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
-      const issueNumbersNote =
-        storedIssueNumbers.length > 0
-          ? `The following GitHub issue numbers were created for this plan and must be passed as \`issueNumbers\` to \`create_pull_request\`: [${storedIssueNumbers.join(", ")}].`
-          : `No GitHub issues were created for this plan. Pass an empty array for \`issueNumbers\`.`;
+      let prMerged = false;
+      let prUrl = "(unknown)";
+      try {
+        const prData = JSON.parse(prCheck.stdout) as {
+          state: string;
+          merged: boolean;
+          url: string;
+        };
+        prMerged = prData.merged;
+        prUrl = prData.url;
+      } catch {
+        ctx.ui.notify("Failed to parse PR metadata from gh output.", "error");
+        return;
+      }
 
-      pi.sendUserMessage(
-        `The active plan has been completed. Please do the following:\n\n` +
-          `1. Review the full plan below and the current conversation thread.\n` +
-          `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
-          `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
-          `3. Make those updates now using the write and edit tools.\n` +
-          `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
-          `5. After committing, draft a pull request and call \`create_pull_request\`.\n\n` +
-          `## PR body template (required)\n\n` +
-          `Use exactly these sections. Detail is welcome in Goal and Concepts & decisions; keep Systems and Test plan tighter:\n\n` +
-          `### Goal\n` +
-          `Overview of what this PR delivers and why it matters — enough context that a reviewer who has not read the plan can orient (not limited to 1–2 sentences).\n\n` +
-          `### Concepts & decisions\n` +
-          `Substantive design story drawn from the plan Decision Log / Architecture deltas. ` +
-          `Each decision may be multi-paragraph (rationale, tradeoff, alternatives when relevant). ` +
-          `Do not dump the full plan or step recipes.\n\n` +
-          `### Systems\n` +
-          `Major modules/commands/tools involved and their role (not a file list).\n\n` +
-          `### Test plan\n` +
-          `2–4 behavioral checks worth running.\n\n` +
-          `Exclude from the body: commit-by-commit narrative, file walkthroughs. ` +
-          `Do not include \`closes #N\` — the extension injects those from \`issueNumbers\`.\n\n` +
-          `## Review comments (optional)\n\n` +
-          `Pass \`comments\` as an array of \`{ body, path, lines }\` for pushback-prone points that belong on a specific hunk. ` +
-          `\`lines\` is \`"42"\` (single line) or \`"42-58"\` (inclusive range) on the new-file side of the diff. ` +
-          `Heuristic: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren't. ` +
-          `Skip routine mechanics and anything that cannot be anchored to a diff hunk. ` +
-          `Pass an empty array if there are no such comments.\n\n` +
-          `Then call \`create_pull_request\` with title, body, issueNumbers, and comments. ` +
-          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
-          `If the tool reports that the PR was created but review posting failed, call \`create_pull_request\` again with the same (or revised) comments to retry the review only — do not open a second PR.\n\n` +
-          `${issueNumbersNote}\n\n` +
-          `## Plan name: ${planName}\n\n` +
-          `## Plan content\n\n${planContent}`,
-        { deliverAs: "followUp" },
-      );
+      if (!prMerged) {
+        ctx.ui.notify(
+          `PR is not yet merged (${prUrl}). Merge it before running /plan-close.`,
+          "warning",
+        );
+        return;
+      }
+
+      ctx.ui.notify(`Archiving merged plan: ${planPath}`, "info");
 
       // Archive the plan file to docs/plans/reference/ before clearing state
       const planFileName = planPath.split("/").pop()!;
