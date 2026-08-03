@@ -1477,6 +1477,95 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── /plan-submit ─────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-submit", {
+    description:
+      "Submit PR for the active plan without closing it — plan remains active for follow-up commits",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan to submit. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      // Check if a PR already exists on this branch before triggering the ceremony
+      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "url,state"]);
+      if (prCheck.code === 0 && prCheck.stdout.trim()) {
+        let prUrl = "(unknown)";
+        try {
+          const prData = JSON.parse(prCheck.stdout) as { url: string; state: string };
+          prUrl = prData.url;
+        } catch {
+          // ignore parse error — prUrl stays as placeholder
+        }
+        ctx.ui.notify(
+          `PR already exists: ${prUrl} — plan remains active. Use /plan-close once it is merged.`,
+          "info",
+        );
+        return;
+      }
+
+      ctx.ui.notify(`Submitting plan: ${planPath}`, "info");
+
+      const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
+      const commitMsg = `plan-submit: ${planName}`;
+
+      const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
+      const issueNumbersNote =
+        storedIssueNumbers.length > 0
+          ? `The following GitHub issue numbers were created for this plan and must be passed as \`issueNumbers\` to \`create_pull_request\`: [${storedIssueNumbers.join(", ")}].`
+          : `No GitHub issues were created for this plan. Pass an empty array for \`issueNumbers\`.`;
+
+      pi.sendUserMessage(
+        `The active plan has been completed. Please do the following:\n\n` +
+          `1. Review the full plan below and the current conversation thread.\n` +
+          `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
+          `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
+          `3. Make those updates now using the write and edit tools.\n` +
+          `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
+          `5. After committing, draft a pull request and call \`create_pull_request\`.\n\n` +
+          `## PR body template (required)\n\n` +
+          `Use exactly these sections. Detail is welcome in Goal and Concepts & decisions; keep Systems and Test plan tighter:\n\n` +
+          `### Goal\n` +
+          `Overview of what this PR delivers and why it matters — enough context that a reviewer who has not read the plan can orient (not limited to 1–2 sentences).\n\n` +
+          `### Concepts & decisions\n` +
+          `Substantive design story drawn from the plan Decision Log / Architecture deltas. ` +
+          `Each decision may be multi-paragraph (rationale, tradeoff, alternatives when relevant). ` +
+          `Do not dump the full plan or step recipes.\n\n` +
+          `### Systems\n` +
+          `Major modules/commands/tools involved and their role (not a file list).\n\n` +
+          `### Test plan\n` +
+          `2–4 behavioral checks worth running.\n\n` +
+          `Exclude from the body: commit-by-commit narrative, file walkthroughs. ` +
+          `Do not include \`closes #N\` — the extension injects those from \`issueNumbers\`.\n\n` +
+          `## Review comments (optional)\n\n` +
+          `Pass \`comments\` as an array of \`{ body, path, lines }\` for pushback-prone points that belong on a specific hunk. ` +
+          `\`lines\` is \`"42"\` (single line) or \`"42-58"\` (inclusive range) on the new-file side of the diff. ` +
+          `Heuristic: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren't. ` +
+          `Skip routine mechanics and anything that cannot be anchored to a diff hunk. ` +
+          `Pass an empty array if there are no such comments.\n\n` +
+          `Then call \`create_pull_request\` with title, body, issueNumbers, and comments. ` +
+          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
+          `If the tool reports that the PR was created but review posting failed, call \`create_pull_request\` again with the same (or revised) comments to retry the review only — do not open a second PR.\n\n` +
+          `${issueNumbersNote}\n\n` +
+          `## Plan name: ${planName}\n\n` +
+          `## Plan content\n\n${planContent}`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
+
   // ── /plan-close ──────────────────────────────────────────────────────────────
   pi.registerCommand("plan-close", {
     description: "Finalize the active plan: update relevant repo files and commit",
