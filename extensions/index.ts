@@ -24,6 +24,15 @@ CORE PRINCIPLES
 4. Avoid redundancy: information appears exactly once.
 5. Document phase scope clearly; defer unrelated work to a "Future Phase" section.
 
+PLAN EXECUTION MODEL
+- This plan is a binding work order, not a brainstorming seed or starting point.
+- The full plan provides context, constraints, contracts, and sequencing.
+- The active Step defines the complete authorized change set.
+- Later Steps explain where the system is going but do not authorize early implementation.
+- Do not add behavior, files, routes, APIs, abstractions, dependencies, UI, tests, or docs beyond what the active Step requires.
+- Do not round out, future-proof, scaffold ahead, beautify, or fill perceived gaps.
+- If the active Step seems underspecified or requires a decision not already made in the plan, stop and ask rather than inventing missing product or design choices.
+
 STRUCTURAL RULES
 - This meta block must remain in all versions of the doc.
 - Append new Steps to the end; do not renumber completed ones.
@@ -103,8 +112,10 @@ END AI_DOC_META_GUIDANCE
 #### Step 1 — [Action-Oriented Title]
 
 **Recipe**
-1) [What changes, not how to click or run commands]
-2) [Reference affected file(s) or function(s)]
+1) [Complete authorized change for this Step]
+2) [Complete authorized change for this Step]
+
+Changes not required by these bullets are out of scope for this Step.
 
 **Verify**
 - [Behavioral outcome]
@@ -219,17 +230,11 @@ interface PrCommentInput {
   lines: string;
 }
 
-function formatPrDraftForConfirm(
-  title: string,
-  body: string,
-  comments: PrCommentInput[],
-): string {
+function formatPrDraftForConfirm(title: string, body: string, comments: PrCommentInput[]): string {
   const commentBlock =
     comments.length === 0
       ? "(none)"
-      : comments
-          .map((c, i) => `${i + 1}. ${c.path}:${c.lines}\n   ${c.body}`)
-          .join("\n\n");
+      : comments.map((c, i) => `${i + 1}. ${c.path}:${c.lines}\n   ${c.body}`).join("\n\n");
   return `Title: ${title}\n\nBody:\n${body}\n\nComments (${comments.length}):\n${commentBlock}`;
 }
 
@@ -732,12 +737,7 @@ export default function (pi: ExtensionAPI) {
       let createdFresh = false;
 
       try {
-        const existing = await pi.exec("gh", [
-          "pr",
-          "view",
-          "--json",
-          "number,url,headRefOid",
-        ]);
+        const existing = await pi.exec("gh", ["pr", "view", "--json", "number,url,headRefOid"]);
         if (existing.code === 0 && existing.stdout.trim()) {
           const data = JSON.parse(existing.stdout) as {
             number: number;
@@ -771,13 +771,7 @@ export default function (pi: ExtensionAPI) {
           prUrl = stdout.trim();
           createdFresh = true;
 
-          const view = await pi.exec("gh", [
-            "pr",
-            "view",
-            prUrl,
-            "--json",
-            "number,headRefOid",
-          ]);
+          const view = await pi.exec("gh", ["pr", "view", prUrl, "--json", "number,headRefOid"]);
           if (view.code !== 0) {
             ctx.ui.notify(`PR created but failed to resolve metadata: ${view.stderr}`, "error");
             return {
@@ -1123,6 +1117,11 @@ export default function (pi: ExtensionAPI) {
         `## Your task\n\n` +
         `Continue implementing **Step ${stepNumber} — ${step.title}**.\n\n` +
         `Step content:\n\n${step.body}\n\n` +
+        `Use the full plan for context, constraints, contracts, and sequencing, but treat only Step ${stepNumber} as authorization to change code. ` +
+        `Implement exactly the active Step Recipe and satisfy its Verify criteria. ` +
+        `Do not add behavior, files, routes, APIs, abstractions, dependencies, UI, tests, or docs beyond what this Step requires. ` +
+        `Do not pre-build later Steps, round out the product, or fill gaps with inferred product/design decisions. ` +
+        `If the Step is underspecified or appears to require out-of-step work, stop and ask. ` +
         `Take into account both the updated plan and the partial work already done above. ` +
         `Complete the step, then call the \`finish_step\` tool with a conventional commit message. ` +
         `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
@@ -1232,6 +1231,11 @@ export default function (pi: ExtensionAPI) {
         `## Your task\n\n` +
         `Implement **Step ${step.number} — ${step.title}**.\n\n` +
         `Step content:\n\n${step.body}\n\n` +
+        `Use the full plan for context, constraints, contracts, and sequencing, but treat only Step ${step.number} as authorization to change code. ` +
+        `Implement exactly the active Step Recipe and satisfy its Verify criteria. ` +
+        `Do not add behavior, files, routes, APIs, abstractions, dependencies, UI, tests, or docs beyond what this Step requires. ` +
+        `Do not pre-build later Steps, round out the product, or fill gaps with inferred product/design decisions. ` +
+        `If the Step is underspecified or appears to require out-of-step work, stop and ask. ` +
         `When you have finished implementing the step, call the \`finish_step\` tool with a ` +
         `conventional commit message describing exactly what you changed. ` +
         `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
