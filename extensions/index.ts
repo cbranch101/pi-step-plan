@@ -1612,6 +1612,91 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── /plan-reopen ─────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-reopen", {
+    description: "Restore a closed plan from docs/plans/reference/ back to the active state",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (state.activePlan) {
+        ctx.ui.notify(
+          `Cannot reopen: plan '${state.activePlan}' is already active. Close it first.`,
+          "warning",
+        );
+        return;
+      }
+
+      const refDir = join(ctx.cwd, PLANS_DIR, "reference");
+
+      let refFiles: string[];
+      try {
+        refFiles = (await readdir(refDir)).filter((f) => f.endsWith(".md")).sort();
+      } catch {
+        refFiles = [];
+      }
+
+      if (refFiles.length === 0) {
+        ctx.ui.notify(`No archived plan files found in ${PLANS_DIR}/reference/.`, "warning");
+        return;
+      }
+
+      if (refFiles.length > 1) {
+        ctx.ui.notify(
+          `Multiple archived plans found in ${PLANS_DIR}/reference/ (${refFiles.join(", ")}). ` +
+            `Cannot auto-select. Please specify which plan to reopen.`,
+          "error",
+        );
+        return;
+      }
+
+      const planFileName = refFiles[0]!;
+      const srcPath = join(refDir, planFileName);
+      const destPath = join(ctx.cwd, PLANS_DIR, planFileName);
+      const planPath = `${PLANS_DIR}/${planFileName}`;
+      const planName = planFileName.replace(/\.md$/, "");
+
+      try {
+        try {
+          await rename(srcPath, destPath);
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+            await copyFile(srcPath, destPath);
+            await unlink(srcPath);
+          } else {
+            throw err;
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Failed to restore plan file: ${msg}`, "error");
+        return;
+      }
+
+      // Restore activePlan in state
+      const updatedState = await readState(ctx.cwd);
+      updatedState.activePlan = planPath;
+      await writeState(ctx.cwd, updatedState);
+
+      // Commit the restore
+      await pi.exec("git", ["add", "-A"]);
+      const { code: commitCode, stderr: commitStderr } = await pi.exec("git", [
+        "commit",
+        "-m",
+        `plan-reopen: ${planName}`,
+      ]);
+
+      if (commitCode !== 0 && !commitStderr.includes("nothing to commit")) {
+        ctx.ui.notify(`git commit failed: ${commitStderr}`, "error");
+        return;
+      }
+
+      ctx.ui.notify(
+        `Plan '${planName}' is active again. Run /next-step to continue or /plan-close to close.`,
+        "info",
+      );
+    },
+  });
+
   // ── /plan-adopt ──────────────────────────────────────────────────────────────
   pi.registerCommand("plan-adopt", {
     description: "Adopt a pre-created plan doc from docs/plans/ without running /plan-start",
