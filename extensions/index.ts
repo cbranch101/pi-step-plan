@@ -782,6 +782,39 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── register_plan tool — agent calls this after committing the plan doc ────────
+  pi.registerTool({
+    name: "register_plan",
+    label: "Register Plan",
+    description:
+      "Call this immediately after committing the plan doc during /plan-finish, before creating GitHub issues. " +
+      "Initializes the plan entry in state so issue numbers can be persisted. Does not activate the plan.",
+    parameters: Type.Object({
+      planPath: Type.String({
+        description: "Relative path to the plan doc, e.g. docs/plans/my-plan.md",
+      }),
+      branch: Type.String({ description: "Feature branch name, e.g. feature/my-plan" }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      if (!state.plans[params.planPath]) {
+        state.plans[params.planPath] = {
+          currentStep: 1,
+          completedSteps: [],
+          githubIssues: [],
+          branch: params.branch,
+        };
+        await writeState(ctx.cwd, state);
+      }
+      return {
+        content: [
+          { type: "text", text: `Plan registered: ${params.planPath} on branch ${params.branch}.` },
+        ],
+        details: undefined,
+      };
+    },
+  });
+
   // ── create_pull_request tool — agent calls this after /plan-close commit ────
   pi.registerTool({
     name: "create_pull_request",
@@ -1160,7 +1193,8 @@ export default function (pi: ExtensionAPI) {
           `5. Ask the user if they have any feedback or changes to the file.\n` +
           `6. Incorporate any feedback by editing the file, repeating step 5 until the user is satisfied.\n` +
           `7. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `8. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `7b. Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n` +
+          `8. After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
           `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
           `9. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
