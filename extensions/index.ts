@@ -815,6 +815,58 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── get_active_pr tool — agent calls this to retrieve current PR metadata ────
+  pi.registerTool({
+    name: "get_active_pr",
+    label: "Get Active PR",
+    description:
+      "Retrieve current PR metadata (number, URL, state, merged status) for the active branch. " +
+      "Returns JSON on success or a descriptive error string if no PR exists or gh is unavailable.",
+    parameters: Type.Object({}),
+    execute: async (_toolCallId, _params, _signal, _onUpdate, _ctx) => {
+      try {
+        const { code, stdout, stderr } = await pi.exec("gh", [
+          "pr",
+          "view",
+          "--json",
+          "number,url,state,headRefName,merged",
+        ]);
+
+        if (code !== 0) {
+          const msg = stderr.trim() || "gh pr view exited with a non-zero code";
+          return {
+            content: [{ type: "text", text: `No PR found for the current branch: ${msg}` }],
+            details: undefined,
+          };
+        }
+
+        const data = JSON.parse(stdout) as {
+          number: number;
+          url: string;
+          state: string;
+          headRefName: string;
+          merged: boolean;
+        };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+          details: undefined,
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to retrieve PR information: ${msg}`,
+            },
+          ],
+          details: undefined,
+        };
+      }
+    },
+  });
+
   // ── create_pull_request tool — agent calls this after /plan-close commit ────
   pi.registerTool({
     name: "create_pull_request",
