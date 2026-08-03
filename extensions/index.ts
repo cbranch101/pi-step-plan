@@ -514,18 +514,6 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
-
-      if (!planPath || !state.plans[planPath]) {
-        return {
-          content: [
-            { type: "text", text: "No active plan found in state. Cannot create GitHub issues." },
-          ],
-          details: undefined,
-        };
-      }
-
       const createdNumbers: number[] = [];
       const feedbackItems: string[] = [];
 
