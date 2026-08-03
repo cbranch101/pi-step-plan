@@ -894,6 +894,21 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Push current branch before attempting PR creation
+      const push = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
+      if (push.code !== 0) {
+        ctx.ui.notify(`git push failed: ${push.stderr}`, "error");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `git push failed: ${push.stderr}. Resolve the push issue and call create_pull_request again.`,
+            },
+          ],
+          details: undefined,
+        };
+      }
+
       // Resolve existing PR on this branch (retry path after review failure) or create one
       let prUrl: string;
       let prNumber: number;
