@@ -630,6 +630,171 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── update_github_issues tool — agent calls this during /modify-plan-finish ──
+  pi.registerTool({
+    name: "update_github_issues",
+    label: "Update GitHub Issues",
+    description:
+      "Call this after the plan doc has been modified during /modify-plan-finish. " +
+      "Submit proposed edits to existing GitHub issues for user review; the extension will handle confirmation and update via gh. " +
+      "Do NOT run gh commands directly. " +
+      "Only issue numbers stored in the plan's githubIssues list are eligible — do NOT pass arbitrary issue numbers. " +
+      "If the tool returns feedback for any issue, revise that issue and call this tool again.",
+    parameters: Type.Object({
+      issues: Type.Array(
+        Type.Object({
+          number: Type.Number({ description: "Existing GitHub issue number" }),
+          title: Type.Optional(Type.String({ description: "New title (omit to leave unchanged)" })),
+          body: Type.Optional(Type.String({ description: "New body (omit to leave unchanged)" })),
+        }),
+        { description: "Proposed edits to present for user review" },
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      const planPath = state.activePlan;
+
+      if (!planPath || !state.plans[planPath]) {
+        return {
+          content: [
+            { type: "text", text: "No active plan found in state. Cannot update GitHub issues." },
+          ],
+          details: undefined,
+        };
+      }
+
+      const allowedNumbers = state.plans[planPath].githubIssues ?? [];
+
+      // Validate all issue numbers before any UI or gh side effects
+      for (const issue of params.issues) {
+        if (!allowedNumbers.includes(issue.number)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Issue #${issue.number} is not in the githubIssues list for this plan ([${allowedNumbers.join(", ")}]). ` +
+                  `Do not pass arbitrary issue numbers — only numbers returned by create_github_issues for this plan are eligible.`,
+              },
+            ],
+            details: undefined,
+          };
+        }
+      }
+
+      const updatedNumbers: number[] = [];
+      const feedbackItems: string[] = [];
+
+      for (const issue of params.issues) {
+        // Fetch current title and body for diff display
+        let currentTitle = "(unknown)";
+        let currentBody = "(unknown)";
+        try {
+          const { code, stdout } = await pi.exec("gh", [
+            "issue",
+            "view",
+            String(issue.number),
+            "--json",
+            "title,body",
+          ]);
+          if (code === 0) {
+            const data = JSON.parse(stdout) as { title: string; body: string };
+            currentTitle = data.title;
+            currentBody = data.body;
+          }
+        } catch {
+          // Continue with unknown placeholders
+        }
+
+        const diffLines: string[] = [`Issue #${issue.number}`];
+        if (issue.title !== undefined) {
+          diffLines.push(`\nTitle:\n  old: ${currentTitle}\n  new: ${issue.title}`);
+        }
+        if (issue.body !== undefined) {
+          diffLines.push(`\nBody:\n  old:\n${currentBody}\n\n  new:\n${issue.body}`);
+        }
+
+        const confirmed = await ctx.ui.confirm(
+          `Update issue #${issue.number}?`,
+          diffLines.join(""),
+        );
+
+        if (confirmed) {
+          const ghArgs = ["issue", "edit", String(issue.number)];
+          if (issue.title !== undefined) {
+            ghArgs.push("--title", issue.title);
+          }
+          if (issue.body !== undefined) {
+            ghArgs.push("--body", issue.body);
+          }
+
+          try {
+            const { code, stderr } = await pi.exec("gh", ghArgs);
+            if (code !== 0) {
+              ctx.ui.notify(`gh issue edit failed: ${stderr}`, "error");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `gh issue edit failed for #${issue.number}: ${stderr}. Do not proceed with remaining issues.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.ui.notify(`gh not available: ${msg}`, "error");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `gh is not installed or not authenticated: ${msg}. Cannot update issues.`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+
+          updatedNumbers.push(issue.number);
+          ctx.ui.notify(`Updated issue #${issue.number}`, "info");
+        } else {
+          const feedback = await ctx.ui.input(
+            `Any feedback on issue #${issue.number}? (leave blank to skip)`,
+          );
+          if (feedback?.trim()) {
+            feedbackItems.push(`- #${issue.number}: ${feedback.trim()}`);
+          }
+        }
+      }
+
+      const updatedSummary =
+        updatedNumbers.length > 0
+          ? `Updated ${updatedNumbers.length} issue(s): ${updatedNumbers.map((n) => `#${n}`).join(", ")}.`
+          : "No issues were updated.";
+
+      if (feedbackItems.length > 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${updatedSummary}\n\n` +
+                `The following issues were declined with feedback — please revise them and call update_github_issues again:\n` +
+                feedbackItems.join("\n"),
+            },
+          ],
+          details: undefined,
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: updatedSummary }],
+        details: undefined,
+      };
+    },
+  });
+
   // ── create_pull_request tool — agent calls this after /plan-close commit ────
   pi.registerTool({
     name: "create_pull_request",
