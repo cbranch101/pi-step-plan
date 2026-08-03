@@ -514,18 +514,6 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
-
-      if (!planPath || !state.plans[planPath]) {
-        return {
-          content: [
-            { type: "text", text: "No active plan found in state. Cannot create GitHub issues." },
-          ],
-          details: undefined,
-        };
-      }
-
       const createdNumbers: number[] = [];
       const feedbackItems: string[] = [];
 
@@ -791,6 +779,91 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: updatedSummary }],
         details: undefined,
       };
+    },
+  });
+
+  // ── register_plan tool — agent calls this after committing the plan doc ────────
+  pi.registerTool({
+    name: "register_plan",
+    label: "Register Plan",
+    description:
+      "Call this immediately after committing the plan doc during /plan-finish, before creating GitHub issues. " +
+      "Initializes the plan entry in state so issue numbers can be persisted. Does not activate the plan.",
+    parameters: Type.Object({
+      planPath: Type.String({
+        description: "Relative path to the plan doc, e.g. docs/plans/my-plan.md",
+      }),
+      branch: Type.String({ description: "Feature branch name, e.g. feature/my-plan" }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const state = await readState(ctx.cwd);
+      if (!state.plans[params.planPath]) {
+        state.plans[params.planPath] = {
+          currentStep: 1,
+          completedSteps: [],
+          githubIssues: [],
+          branch: params.branch,
+        };
+        await writeState(ctx.cwd, state);
+      }
+      return {
+        content: [
+          { type: "text", text: `Plan registered: ${params.planPath} on branch ${params.branch}.` },
+        ],
+        details: undefined,
+      };
+    },
+  });
+
+  // ── get_active_pr tool — agent calls this to retrieve current PR metadata ────
+  pi.registerTool({
+    name: "get_active_pr",
+    label: "Get Active PR",
+    description:
+      "Retrieve current PR metadata (number, URL, state, merged status) for the active branch. " +
+      "Returns JSON on success or a descriptive error string if no PR exists or gh is unavailable.",
+    parameters: Type.Object({}),
+    execute: async (_toolCallId, _params, _signal, _onUpdate, _ctx) => {
+      try {
+        const { code, stdout, stderr } = await pi.exec("gh", [
+          "pr",
+          "view",
+          "--json",
+          "number,url,state,headRefName,merged",
+        ]);
+
+        if (code !== 0) {
+          const msg = stderr.trim() || "gh pr view exited with a non-zero code";
+          return {
+            content: [{ type: "text", text: `No PR found for the current branch: ${msg}` }],
+            details: undefined,
+          };
+        }
+
+        const data = JSON.parse(stdout) as {
+          number: number;
+          url: string;
+          state: string;
+          headRefName: string;
+          merged: boolean;
+        };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+          details: undefined,
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to retrieve PR information: ${msg}`,
+            },
+          ],
+          details: undefined,
+        };
+      }
     },
   });
 
@@ -1172,7 +1245,8 @@ export default function (pi: ExtensionAPI) {
           `5. Ask the user if they have any feedback or changes to the file.\n` +
           `6. Incorporate any feedback by editing the file, repeating step 5 until the user is satisfied.\n` +
           `7. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `8. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+          `7b. Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n` +
+          `8. After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
           `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
           `9. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
@@ -1403,14 +1477,15 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /plan-close ──────────────────────────────────────────────────────────────
-  pi.registerCommand("plan-close", {
-    description: "Finalize the active plan: update relevant repo files and commit",
+  // ── /plan-submit ─────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-submit", {
+    description:
+      "Submit PR for the active plan without closing it — plan remains active for follow-up commits",
     handler: async (_args, ctx) => {
       const state = await readState(ctx.cwd);
 
       if (!state.activePlan) {
-        ctx.ui.notify("No active plan to close. Run /activate-plan first.", "warning");
+        ctx.ui.notify("No active plan to submit. Run /activate-plan first.", "warning");
         return;
       }
 
@@ -1424,10 +1499,27 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.notify(`Closing plan: ${planPath}`, "info");
+      // Check if a PR already exists on this branch before triggering the ceremony
+      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "url,state"]);
+      if (prCheck.code === 0 && prCheck.stdout.trim()) {
+        let prUrl = "(unknown)";
+        try {
+          const prData = JSON.parse(prCheck.stdout) as { url: string; state: string };
+          prUrl = prData.url;
+        } catch {
+          // ignore parse error — prUrl stays as placeholder
+        }
+        ctx.ui.notify(
+          `PR already exists: ${prUrl} — plan remains active. Use /plan-close once it is merged.`,
+          "info",
+        );
+        return;
+      }
+
+      ctx.ui.notify(`Submitting plan: ${planPath}`, "info");
 
       const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
-      const commitMsg = `plan-close: ${planName}`;
+      const commitMsg = `plan-submit: ${planName}`;
 
       const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
       const issueNumbersNote =
@@ -1471,6 +1563,64 @@ export default function (pi: ExtensionAPI) {
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
       );
+    },
+  });
+
+  // ── /plan-close ──────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-close", {
+    description: "Archive the active plan — only runs after the PR has been merged",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan to close. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+      const branch = state.plans[planPath]?.branch ?? "(unknown)";
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+        void planContent; // read only to confirm file exists
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      // Check whether the PR has been merged before doing anything
+      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "state,merged,url"]);
+
+      if (prCheck.code !== 0) {
+        ctx.ui.notify(`No PR found for branch '${branch}'. Run /plan-submit first.`, "warning");
+        return;
+      }
+
+      let prMerged = false;
+      let prUrl = "(unknown)";
+      try {
+        const prData = JSON.parse(prCheck.stdout) as {
+          state: string;
+          merged: boolean;
+          url: string;
+        };
+        prMerged = prData.merged;
+        prUrl = prData.url;
+      } catch {
+        ctx.ui.notify("Failed to parse PR metadata from gh output.", "error");
+        return;
+      }
+
+      if (!prMerged) {
+        ctx.ui.notify(
+          `PR is not yet merged (${prUrl}). Merge it before running /plan-close.`,
+          "warning",
+        );
+        return;
+      }
+
+      ctx.ui.notify(`Archiving merged plan: ${planPath}`, "info");
 
       // Archive the plan file to docs/plans/reference/ before clearing state
       const planFileName = planPath.split("/").pop()!;
