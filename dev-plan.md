@@ -14,6 +14,16 @@ It describes *only* what is required to complete this specific phase of work —
 5. Document **phase scope** clearly; defer unrelated work to a "Future Phase" section.
 
 ───────────────────────────────
+## PLAN EXECUTION MODEL
+- This plan is a binding work order, not a brainstorming seed or starting point.
+- The full plan provides context, constraints, contracts, and sequencing.
+- The active Step defines the complete authorized change set.
+- Later Steps explain where the system is going but do not authorize early implementation.
+- Do not add behavior, files, routes, APIs, abstractions, dependencies, UI, tests, or docs beyond what the active Step requires.
+- Do not round out, future-proof, scaffold ahead, beautify, or fill perceived gaps.
+- If the active Step seems underspecified or requires a decision not already made in the plan, stop and ask rather than inventing missing product or design choices.
+
+───────────────────────────────
 ## STRUCTURAL RULES
 - This meta block must remain in all versions of the doc.
 - Append new Steps to the end; do not renumber completed ones.
@@ -119,10 +129,10 @@ Each Step = one atomic unit of work that produces a testable outcome.
 #### Step N — <Action-Oriented Title>
 
 **Recipe**
-1) Describe *what changes*, not *how to click or run commands*.
-2) Reference affected file(s) or function(s).
-3) Summarize commands or processes generically.
-4) Keep ≤4 bullets total.
+1) List the complete authorized changes for this Step, not how to click or run commands.
+2) Reference affected file(s) or function(s) when that narrows the authorized scope.
+3) Summarize commands or processes generically when needed for validation.
+4) Keep ≤4 bullets total; changes not required by these bullets are out of scope for this Step.
 
 **Verify**
 - [ ] Behavioral outcome.
@@ -295,7 +305,7 @@ create_pull_request     — agent submits drafted PR title/body and line-anchore
 
 **Notes**
 
-- Issue body should describe *the problem being solved*, not reproduce the plan. The agent prompt should make this framing explicit.
+- Issue body should describe _the problem being solved_, not reproduce the plan. The agent prompt should make this framing explicit.
 
 ---
 
@@ -470,7 +480,7 @@ create_pull_request     — agent submits drafted PR title/body and line-anchore
    - **Concepts & decisions** — substantive design story drawn from the plan Decision Log / Architecture deltas; each decision may be multi-paragraph (rationale, tradeoff, alternatives when relevant). Do not dump the full plan or step recipes.
    - **Systems** — major modules/commands/tools involved and their role (not a file list).
    - **Test plan** — 2–4 behavioral checks worth running.
-   Exclude: commit-by-commit narrative, file walkthroughs. Pushback-prone points that belong on a specific hunk go in `comments`, not the body.
+     Exclude: commit-by-commit narrative, file walkthroughs. Pushback-prone points that belong on a specific hunk go in `comments`, not the body.
 2. Extend `create_pull_request` with `comments: Array<{ body: string; path: string; lines: string }>` (empty array allowed). `lines` is `"42"` or `"42-58"` (inclusive); the tool parses that into GitHub `line` / `start_line` and rejects invalid forms. Before any `gh` call, show one confirmation with title, full body (with injected `closes #N`), and each planned comment as `path:lines` + body. On decline with feedback, return it so the agent can revise title/body/comments and call again.
 3. On approval: run `gh pr create`, resolve PR number + head commit SHA, then post **one** pull-request review (`event: COMMENT`, `side: RIGHT`) via `gh api` with all inline comments. Comments must target lines present in the PR diff. If PR creation succeeds but the review fails, return the PR URL and the error; instruct the agent to retry only the review/comments (do not recreate the PR). Heuristic for comments: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren’t — skip routine mechanics and anything that cannot be anchored to a diff hunk.
 
