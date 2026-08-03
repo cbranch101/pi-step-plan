@@ -1477,20 +1477,22 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /plan-submit ─────────────────────────────────────────────────────────────
-  pi.registerCommand("plan-submit", {
-    description:
-      "Submit PR for the active plan without closing it — plan remains active for follow-up commits",
+  // ── /plan-close ──────────────────────────────────────────────────────────────
+  pi.registerCommand("plan-close", {
+    description: "Archive the active plan, commit, then create a PR or push if one already exists",
     handler: async (_args, ctx) => {
       const state = await readState(ctx.cwd);
 
       if (!state.activePlan) {
-        ctx.ui.notify("No active plan to submit. Run /activate-plan first.", "warning");
+        ctx.ui.notify("No active plan to close. Run /activate-plan first.", "warning");
         return;
       }
 
       const planPath = state.activePlan;
+      const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
+      const branch = state.plans[planPath]?.branch ?? "(unknown)";
 
+      // Read plan content now — needed for the PR prompt after archiving
       let planContent: string;
       try {
         planContent = await readFile(join(ctx.cwd, planPath), "utf8");
@@ -1499,9 +1501,56 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Check if a PR already exists on this branch before triggering the ceremony
-      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "url,state"]);
+      ctx.ui.notify(`Closing plan: ${planPath}`, "info");
+
+      // 1. Archive the plan file to docs/plans/reference/
+      const planFileName = planPath.split("/").pop()!;
+      const refDir = join(ctx.cwd, PLANS_DIR, "reference");
+      const srcPath = join(ctx.cwd, planPath);
+      const destPath = join(refDir, planFileName);
+
+      try {
+        await mkdir(refDir, { recursive: true });
+        try {
+          await rename(srcPath, destPath);
+        } catch (err: unknown) {
+          // EXDEV: cross-device rename — fall back to copy + delete
+          if ((err as NodeJS.ErrnoException).code === "EXDEV") {
+            await copyFile(srcPath, destPath);
+            await unlink(srcPath);
+          } else {
+            throw err;
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Failed to archive plan file: ${msg}`, "error");
+        return;
+      }
+
+      // 2. Clear activePlan from state — only after successful archive
+      const updatedState = await readState(ctx.cwd);
+      updatedState.activePlan = null;
+      await writeState(ctx.cwd, updatedState);
+
+      // 3. Commit the archive + state change
+      await pi.exec("git", ["add", "-A"]);
+      const { code: commitCode, stderr: commitStderr } = await pi.exec("git", [
+        "commit",
+        "-m",
+        `plan-close: ${planName}`,
+      ]);
+
+      if (commitCode !== 0 && !commitStderr.includes("nothing to commit")) {
+        ctx.ui.notify(`git commit failed: ${commitStderr}`, "error");
+        return;
+      }
+
+      // 4. Check for an existing PR using the stored branch name explicitly
+      const prCheck = await pi.exec("gh", ["pr", "view", branch, "--json", "url,state"]);
+
       if (prCheck.code === 0 && prCheck.stdout.trim()) {
+        // PR exists — just push
         let prUrl = "(unknown)";
         try {
           const prData = JSON.parse(prCheck.stdout) as { url: string; state: string };
@@ -1509,32 +1558,29 @@ export default function (pi: ExtensionAPI) {
         } catch {
           // ignore parse error — prUrl stays as placeholder
         }
-        ctx.ui.notify(
-          `PR already exists: ${prUrl} — plan remains active. Use /plan-close once it is merged.`,
-          "info",
-        );
+        ctx.ui.notify(`PR already exists: ${prUrl} — pushing...`, "info");
+        const pushResult = await pi.exec("git", ["push"]);
+        if (pushResult.code !== 0) {
+          ctx.ui.notify(`git push failed: ${pushResult.stderr}`, "error");
+          return;
+        }
+        ctx.ui.notify(`Plan closed and pushed to existing PR: ${prUrl}`, "info");
         return;
       }
 
-      ctx.ui.notify(`Submitting plan: ${planPath}`, "info");
-
-      const planName = planPath.split("/").pop()?.replace(/\.md$/, "") ?? planPath;
-      const commitMsg = `plan-submit: ${planName}`;
-
+      // No PR — trigger agent to draft and call create_pull_request
       const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
       const issueNumbersNote =
         storedIssueNumbers.length > 0
           ? `The following GitHub issue numbers were created for this plan and must be passed as \`issueNumbers\` to \`create_pull_request\`: [${storedIssueNumbers.join(", ")}].`
           : `No GitHub issues were created for this plan. Pass an empty array for \`issueNumbers\`.`;
 
+      ctx.ui.notify(`No PR found for branch '${branch}' — asking agent to create one.`, "info");
+
       pi.sendUserMessage(
-        `The active plan has been completed. Please do the following:\n\n` +
-          `1. Review the full plan below and the current conversation thread.\n` +
-          `2. Identify any other files in this repo that should be updated with decisions or outcomes ` +
-          `from this plan (e.g. README.md, AGENTS.md, architecture docs, changelogs).\n` +
-          `3. Make those updates now using the write and edit tools.\n` +
-          `4. When done, run: \`git add -A && git commit -m "${commitMsg}"\`\n` +
-          `5. After committing, draft a pull request and call \`create_pull_request\`.\n\n` +
+        `The plan has been archived and committed on branch \`${branch}\`. Please do the following now:\n\n` +
+          `1. Review the plan below and the current conversation thread to understand what was implemented.\n` +
+          `2. Draft a pull request and call \`create_pull_request\`.\n\n` +
           `## PR body template (required)\n\n` +
           `Use exactly these sections. Detail is welcome in Goal and Concepts & decisions; keep Systems and Test plan tighter:\n\n` +
           `### Goal\n` +
@@ -1563,94 +1609,6 @@ export default function (pi: ExtensionAPI) {
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
       );
-    },
-  });
-
-  // ── /plan-close ──────────────────────────────────────────────────────────────
-  pi.registerCommand("plan-close", {
-    description: "Archive the active plan — only runs after the PR has been merged",
-    handler: async (_args, ctx) => {
-      const state = await readState(ctx.cwd);
-
-      if (!state.activePlan) {
-        ctx.ui.notify("No active plan to close. Run /activate-plan first.", "warning");
-        return;
-      }
-
-      const planPath = state.activePlan;
-      const branch = state.plans[planPath]?.branch ?? "(unknown)";
-
-      let planContent: string;
-      try {
-        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
-        void planContent; // read only to confirm file exists
-      } catch {
-        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
-        return;
-      }
-
-      // Check whether the PR has been merged before doing anything
-      const prCheck = await pi.exec("gh", ["pr", "view", "--json", "state,mergedAt,url"]);
-
-      if (prCheck.code !== 0) {
-        ctx.ui.notify(`No PR found for branch '${branch}'. Run /plan-submit first.`, "warning");
-        return;
-      }
-
-      let prMerged = false;
-      let prUrl = "(unknown)";
-      try {
-        const prData = JSON.parse(prCheck.stdout) as {
-          state: string;
-          mergedAt: string | null;
-          url: string;
-        };
-        prMerged = prData.mergedAt !== null;
-        prUrl = prData.url;
-      } catch {
-        ctx.ui.notify("Failed to parse PR metadata from gh output.", "error");
-        return;
-      }
-
-      if (!prMerged) {
-        ctx.ui.notify(
-          `PR is not yet merged (${prUrl}). Merge it before running /plan-close.`,
-          "warning",
-        );
-        return;
-      }
-
-      ctx.ui.notify(`Archiving merged plan: ${planPath}`, "info");
-
-      // Archive the plan file to docs/plans/reference/ before clearing state
-      const planFileName = planPath.split("/").pop()!;
-      const refDir = join(ctx.cwd, PLANS_DIR, "reference");
-      const srcPath = join(ctx.cwd, planPath);
-      const destPath = join(refDir, planFileName);
-
-      try {
-        await mkdir(refDir, { recursive: true });
-        try {
-          await rename(srcPath, destPath);
-        } catch (err: unknown) {
-          // EXDEV: cross-device rename — fall back to copy + delete
-          if ((err as NodeJS.ErrnoException).code === "EXDEV") {
-            await copyFile(srcPath, destPath);
-            await unlink(srcPath);
-          } else {
-            throw err;
-          }
-        }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.ui.notify(`Failed to archive plan file: ${msg}`, "error");
-        return;
-      }
-
-      // Clear activePlan from state — only after successful archive
-      const updatedState = await readState(ctx.cwd);
-      updatedState.activePlan = null;
-      await writeState(ctx.cwd, updatedState);
     },
   });
 
