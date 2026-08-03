@@ -1295,6 +1295,63 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── /modify-plan-start ─────────────────────────────────────────────────────
+  pi.registerCommand("modify-plan-start", {
+    description: "Load the active plan and set the agent up to modify future steps",
+    handler: async (_args, ctx) => {
+      const state = await readState(ctx.cwd);
+
+      if (!state.activePlan) {
+        ctx.ui.notify("No active plan. Run /activate-plan first.", "warning");
+        return;
+      }
+
+      const planPath = state.activePlan;
+      const progress = state.plans[planPath];
+      const currentStep = progress?.currentStep ?? 1;
+
+      // Warn if plan file has uncommitted changes
+      const { stdout: diffOutput } = await pi.exec("git", ["diff", "HEAD", "--", planPath]);
+      if (diffOutput.trim()) {
+        ctx.ui.notify(
+          `⚠️ The plan file (${planPath}) has uncommitted changes. ` +
+            `These may be lost or cause conflicts. Consider committing or reverting before modifying.`,
+          "warning",
+        );
+      }
+
+      let planContent: string;
+      try {
+        planContent = await readFile(join(ctx.cwd, planPath), "utf8");
+      } catch {
+        ctx.ui.notify(`Cannot read plan file: ${planPath}`, "error");
+        return;
+      }
+
+      ctx.ui.notify(
+        `Loading plan for modification. Current step: ${currentStep}. Steps 1–${currentStep} are locked; non-step sections are freely editable.`,
+        "info",
+      );
+
+      pi.sendUserMessage(
+        `You are being asked to help the user modify the active plan. Here is the current plan:\n\n` +
+          `${planContent}\n\n` +
+          `---\n\n` +
+          `## Modification fence\n\n` +
+          `The current step is **Step ${currentStep}**. ` +
+          `All non-step sections of the plan (Project Summary, Goals, Architecture, Constraints, Interfaces, Dependencies, Risks, Decision Log, etc.) are freely editable. ` +
+          `Within the Steps section, Steps 1 through ${currentStep} (inclusive) are **locked** — they must not be modified under any circumstances. ` +
+          `Only steps strictly after Step ${currentStep} may be changed.\n\n` +
+          `## Your task\n\n` +
+          `Ask the user what changes they would like to make to the plan. ` +
+          `Do not propose changes yourself or analyze the plan unprompted. ` +
+          `Once the user describes what they want, help them make those changes (updating non-step sections freely, and only touching steps after Step ${currentStep}). ` +
+          `When the modifications are complete, the user will run \`/modify-plan-finish\` to trigger the consistency check, approval loop, commit, and issue updates.`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
+
   // ── /activate-plan ──────────────────────────────────────────────────────────
   pi.registerCommand("activate-plan", {
     description: "Select a plan from docs/plans/ and set it as the active plan",
