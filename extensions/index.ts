@@ -1278,23 +1278,40 @@ export default function (pi: ExtensionAPI) {
       );
 
       pi.sendUserMessage(
-        `Our planning discussion is complete. Please do the following now:\n\n` +
-          `1. Review our full conversation above and extract all decisions, goals, constraints, ` +
-          `architecture choices, and action items.\n` +
-          `2. Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign").\n` +
-          `3. Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
-          `4. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
-          `5. Ask the user if they have any feedback or changes to the file.\n` +
-          `6. Incorporate any feedback by editing the file, repeating step 5 until the user is satisfied.\n` +
-          `7. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `7b. Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n` +
-          `8. After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+        `Our planning discussion is complete. Follow this exact sequence — do not skip or reorder steps:\n\n` +
+          `**a. Extract conversation context**\n` +
+          `Review the full conversation above and extract all decisions, goals, constraints, architecture choices, and action items.\n\n` +
+          `**b. Choose slug and set up branch**\n` +
+          `Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign"). ` +
+          `Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. ` +
+          `Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n\n` +
+          `**c. Write the first-pass plan doc to disk**\n` +
+          `Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. ` +
+          `Fill in every section from our conversation — do not leave any placeholders.\n\n` +
+          `**d. Read the granularity reference**\n` +
+          `Read \`docs/step-granularity.md\` before proceeding to the review pass.\n\n` +
+          `**e. Walk each step one at a time — do not rush ahead**\n` +
+          `For each step in the Steps section, read it from disk and answer both questions:\n` +
+          `  1. "If I were implementing this step right now, would I know exactly what to do, or would I have to make a design decision the user has not approved?"\n` +
+          `  2. "Is this step too big per the granularity reference?"\n` +
+          `If either question surfaces an issue: stop, ask the user to resolve it, update the step on disk with the decision, then move to the next step. ` +
+          `Do not move to the next step until the current step is resolved and written to disk.\n\n` +
+          `**f. Present the plan for final approval**\n` +
+          `After all steps pass the review, present the completed plan to the user for final approval.\n\n` +
+          `**g. Incorporate feedback**\n` +
+          `Incorporate any feedback by editing the file; repeat until the user explicitly approves.\n\n` +
+          `**h. Commit**\n` +
+          `Once approved, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
+          `**i. Register the plan**\n` +
+          `Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n\n` +
+          `**j. Create GitHub issues**\n` +
+          `After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
-          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
-          `9. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections. ` +
+          `Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
           `If the user requests changes, revise the outline and call the tool again. ` +
-          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
-          `10. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
+          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result. ` +
+          `Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
