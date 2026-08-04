@@ -281,6 +281,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   let planMode = false;
+  // eslint-disable-next-line prefer-const -- reassigned by /modify-plan-start and /modify-plan-finish in Step 3
+  let modifyPlanMode = false;
   let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
@@ -1163,49 +1165,89 @@ export default function (pi: ExtensionAPI) {
 
   // ── Block destructive tools in plan mode ────────────────────────────────────
   pi.on("tool_call", (event, ctx) => {
-    if (!planMode) return;
+    if (!planMode && !modifyPlanMode) return;
 
     if (["write", "edit"].includes(event.toolName)) {
-      // In all plan modes, allow writes anywhere inside docs/
-      const inputPath = (event.input as { path?: string }).path;
-      if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
+      if (planMode) {
+        // In plan mode, allow writes anywhere inside docs/
+        const inputPath = (event.input as { path?: string }).path;
+        if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
 
-      ctx.ui.notify(
-        `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
-        "warning",
-      );
-      return {
-        block: true,
-        reason:
-          "Plan mode is active. write and edit are disabled outside of docs/. " +
-          "Discuss and plan only — no implementation. Run /plan-finish when done.",
-      };
+        ctx.ui.notify(
+          `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
+          "warning",
+        );
+        return {
+          block: true,
+          reason:
+            "Plan mode is active. write and edit are disabled outside of docs/. " +
+            "Discuss and plan only — no implementation. Run /plan-finish when done.",
+        };
+      }
+
+      if (modifyPlanMode) {
+        // In modify plan mode, block all paths — no docs/ exception
+        ctx.ui.notify(
+          "⏸ Modify plan mode: write/edit blocked. Run /modify-plan-finish to apply changes.",
+          "warning",
+        );
+        return {
+          block: true,
+          reason:
+            "Modify plan investigation phase is active. write and edit are disabled. " +
+            "Discuss and propose only — run /modify-plan-finish when the user confirms the proposal.",
+        };
+      }
     }
   });
 
   // ── Inject system prompt addition in plan mode ──────────────────────────────
   pi.on("before_agent_start", (event) => {
-    if (!planMode) return;
+    if (!planMode && !modifyPlanMode) return;
 
-    return {
-      systemPrompt:
-        event.systemPrompt +
-        `\n\n## ⏸ PLAN MODE ACTIVE\n` +
-        `You are in a structured planning conversation. Your ONLY job right now is to think, ` +
-        `ask clarifying questions, and discuss the approach.\n` +
-        `\n` +
-        `**You must NOT:**\n` +
-        `- Call write or edit outside of the docs/ directory\n` +
-        `- Start implementing anything\n` +
-        `- Write code in responses unless it is illustrative pseudocode\n` +
-        `\n` +
-        `**You MUST:**\n` +
-        `- Ask questions to fill in gaps before proposing a design\n` +
-        `- Produce a clear, structured plan when asked\n` +
-        `- Stay in discussion mode until the user runs /plan-finish\n` +
-        `\nWhen /plan-finish is called, you will be asked to populate this template from our conversation:\n\n` +
-        PLAN_TEMPLATE,
-    };
+    if (planMode) {
+      return {
+        systemPrompt:
+          event.systemPrompt +
+          `\n\n## ⏸ PLAN MODE ACTIVE\n` +
+          `You are in a structured planning conversation. Your ONLY job right now is to think, ` +
+          `ask clarifying questions, and discuss the approach.\n` +
+          `\n` +
+          `**You must NOT:**\n` +
+          `- Call write or edit outside of the docs/ directory\n` +
+          `- Start implementing anything\n` +
+          `- Write code in responses unless it is illustrative pseudocode\n` +
+          `\n` +
+          `**You MUST:**\n` +
+          `- Ask questions to fill in gaps before proposing a design\n` +
+          `- Produce a clear, structured plan when asked\n` +
+          `- Stay in discussion mode until the user runs /plan-finish\n` +
+          `\nWhen /plan-finish is called, you will be asked to populate this template from our conversation:\n\n` +
+          PLAN_TEMPLATE,
+      };
+    }
+
+    if (modifyPlanMode) {
+      return {
+        systemPrompt:
+          event.systemPrompt +
+          `\n\n## ⏸ MODIFY PLAN MODE — INVESTIGATION ONLY\n` +
+          `You are in the investigation phase of a plan modification. Your ONLY job right now is to ` +
+          `investigate the current state and propose a precise change — do not apply anything.\n` +
+          `\n` +
+          `**You must NOT:**\n` +
+          `- Call write or edit on any path — these are mechanically blocked and will fail\n` +
+          `- Run any git commands or make commits\n` +
+          `- Apply any changes, even ones that seem obviously correct\n` +
+          `\n` +
+          `**You MUST:**\n` +
+          `- Read the plan and any files it references before forming a response\n` +
+          `- Ask the user what they want to change — do not assume\n` +
+          `- Check feasibility against the actual files on disk — do not take the request at face value\n` +
+          `- Ask clarifying questions until the intended change is fully unambiguous\n` +
+          `- Only prompt the user to run /modify-plan-finish once they have explicitly confirmed the proposal\n`,
+      };
+    }
   });
 
   // ── /plan-start ─────────────────────────────────────────────────────────────
@@ -1236,23 +1278,40 @@ export default function (pi: ExtensionAPI) {
       );
 
       pi.sendUserMessage(
-        `Our planning discussion is complete. Please do the following now:\n\n` +
-          `1. Review our full conversation above and extract all decisions, goals, constraints, ` +
-          `architecture choices, and action items.\n` +
-          `2. Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign").\n` +
-          `3. Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
-          `4. Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. Fill in every section from our conversation — do not leave placeholders.\n` +
-          `5. Ask the user if they have any feedback or changes to the file.\n` +
-          `6. Incorporate any feedback by editing the file, repeating step 5 until the user is satisfied.\n` +
-          `7. Once the user approves, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n` +
-          `7b. Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n` +
-          `8. After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
+        `Our planning discussion is complete. Follow this exact sequence — do not skip or reorder steps:\n\n` +
+          `**a. Extract conversation context**\n` +
+          `Review the full conversation above and extract all decisions, goals, constraints, architecture choices, and action items.\n\n` +
+          `**b. Choose slug and set up branch**\n` +
+          `Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign"). ` +
+          `Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. ` +
+          `Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n\n` +
+          `**c. Write the first-pass plan doc to disk**\n` +
+          `Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. ` +
+          `Fill in every section from our conversation — do not leave any placeholders.\n\n` +
+          `**d. Read the granularity reference**\n` +
+          `Read \`docs/step-granularity.md\` before proceeding to the review pass.\n\n` +
+          `**e. Walk each step one at a time — do not rush ahead**\n` +
+          `For each step in the Steps section, read it from disk and answer both questions:\n` +
+          `  1. "If I were implementing this step right now, would I know exactly what to do, or would I have to make a design decision the user has not approved?"\n` +
+          `  2. "Is this step too big per the granularity reference?"\n` +
+          `If either question surfaces an issue: stop, ask the user to resolve it, update the step on disk with the decision, then move to the next step. ` +
+          `Do not move to the next step until the current step is resolved and written to disk.\n\n` +
+          `**f. Present the plan for final approval**\n` +
+          `After all steps pass the review, present the completed plan to the user for final approval.\n\n` +
+          `**g. Incorporate feedback**\n` +
+          `Incorporate any feedback by editing the file; repeat until the user explicitly approves.\n\n` +
+          `**h. Commit**\n` +
+          `Once approved, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
+          `**i. Register the plan**\n` +
+          `Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n\n` +
+          `**j. Create GitHub issues**\n` +
+          `After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
           `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
-          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
-          `9. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
+          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections. ` +
+          `Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
           `If the user requests changes, revise the outline and call the tool again. ` +
-          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
-          `10. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
+          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result. ` +
+          `Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
@@ -1293,25 +1352,37 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      modifyPlanMode = true;
+
       ctx.ui.notify(
         `Loading plan for modification. Current step: ${currentStep}. Steps 1–${currentStep} are locked; non-step sections are freely editable.`,
         "info",
       );
 
       pi.sendUserMessage(
-        `You are being asked to help the user modify the active plan. Here is the current plan:\n\n` +
-          `${planContent}\n\n` +
-          `---\n\n` +
-          `## Modification fence\n\n` +
-          `The current step is **Step ${currentStep}**. ` +
+        `You are in **modify-plan investigation mode**. Write and edit are mechanically blocked — you cannot touch any file until the user runs \`/modify-plan-finish\`. Do not attempt to call \`write\` or \`edit\`, and do not run any git commands.
+
+Here is the current plan:
+
+${planContent}
+
+---
+
+## Modification fence
+
+The current step is **Step ${currentStep}**. ` +
           `All non-step sections of the plan (Project Summary, Goals, Architecture, Constraints, Interfaces, Dependencies, Risks, Decision Log, etc.) are freely editable. ` +
           `Within the Steps section, Steps 1 through ${currentStep} (inclusive) are **locked** — they must not be modified under any circumstances. ` +
           `Only steps strictly after Step ${currentStep} may be changed.\n\n` +
           `## Your task\n\n` +
-          `Ask the user what changes they would like to make to the plan. ` +
-          `Do not propose changes yourself or analyze the plan unprompted. ` +
-          `Once the user describes what they want, help them make those changes (updating non-step sections freely, and only touching steps after Step ${currentStep}). ` +
-          `When the modifications are complete, the user will run \`/modify-plan-finish\` to trigger the consistency check, approval loop, commit, and issue updates.`,
+          `Your job right now is to investigate and propose — not to apply any changes. Follow this sequence:\n\n` +
+          `1. Read any files referenced in the plan that are relevant to the area the user wants to change.\n` +
+          `2. Ask the user what changes they want — do not assume or invent a change yourself.\n` +
+          `3. Investigate whether those changes are feasible given the current codebase and plan. Surface any implications, conflicts, or risks.\n` +
+          `4. Ask clarifying questions until the intended change is fully unambiguous — do not proceed on a vague request.\n` +
+          `5. Present a precise proposal describing exactly what would change in the plan and why.\n` +
+          `6. Once the user explicitly confirms the proposal, prompt them to run \`/modify-plan-finish\` to apply it.\n\n` +
+          `Do not edit any files or run git at any point during this session.`,
         { deliverAs: "followUp" },
       );
     },
@@ -1343,19 +1414,21 @@ export default function (pi: ExtensionAPI) {
             `Do NOT run \`gh issue edit\` directly — only the tool is allowed to do that.`
           : `## GitHub issue updates\n\nNo GitHub issues were created for this plan — skip this step.`;
 
+      modifyPlanMode = false;
+
       ctx.ui.notify(
         `Running /modify-plan-finish for plan: ${planPath} (current step: ${currentStep})`,
         "info",
       );
 
       pi.sendUserMessage(
-        `The plan modification session is complete. Please do the following now:\n\n` +
-          `1. **Forward consistency check**: Scan all steps after the earliest modified step through the end of the plan. ` +
-          `Verify that each step is still internally consistent and consistent with the changes made. ` +
-          `Update any steps that are out of sync with the modifications.\n\n` +
-          `2. **User approval**: Present the full set of proposed changes (both the modifications and any consistency updates) to the user for approval. ` +
-          `Incorporate any feedback and loop until the user explicitly approves the final plan.\n\n` +
-          `3. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
+        `The write block has been lifted. You may now edit files and run git commands.\n\n` +
+          `## Your task\n\n` +
+          `Apply the plan changes that were agreed in this conversation. Follow this exact sequence:\n\n` +
+          `1. **Identify the agreed proposal**: Scroll back through this conversation to find the precise proposal the user explicitly confirmed. Apply those changes — and only those changes — to the plan file. Do not invent or add anything beyond what was agreed.\n\n` +
+          `2. **Forward consistency check**: After applying the agreed changes, scan all steps after the earliest modified step through the end of the plan. Verify each is still internally consistent and consistent with the modifications. Update any steps that are out of sync.\n\n` +
+          `3. **User approval**: Present the full diff of changes (both the agreed modifications and any consistency updates) to the user for approval. Incorporate feedback and loop until the user explicitly approves the final plan.\n\n` +
+          `4. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
           `(replace \`<short reason>\` with a concise description of what was changed, e.g. "add retry logic to step 4").\n\n` +
           issueSection,
         { deliverAs: "followUp" },
@@ -1471,6 +1544,7 @@ export default function (pi: ExtensionAPI) {
         `If the Step is underspecified or appears to require out-of-step work, stop and ask. ` +
         `When you have finished implementing the step, call the \`finish_step\` tool with a ` +
         `conventional commit message describing exactly what you changed. ` +
+        `Do not run \`git add\` or \`git commit\` manually — \`finish_step\` handles staging and committing. ` +
         `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
 
       pi.sendUserMessage(message, { deliverAs: "followUp" });
