@@ -1471,6 +1471,7 @@ export default function (pi: ExtensionAPI) {
         `If the Step is underspecified or appears to require out-of-step work, stop and ask. ` +
         `When you have finished implementing the step, call the \`finish_step\` tool with a ` +
         `conventional commit message describing exactly what you changed. ` +
+        `Do not run \`git add\` or \`git commit\` manually — \`finish_step\` handles staging and committing. ` +
         `Do not call any other tools after \`finish_step\`. Do not proceed to any other steps.`;
 
       pi.sendUserMessage(message, { deliverAs: "followUp" });
