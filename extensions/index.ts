@@ -1335,25 +1335,37 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      modifyPlanMode = true;
+
       ctx.ui.notify(
         `Loading plan for modification. Current step: ${currentStep}. Steps 1–${currentStep} are locked; non-step sections are freely editable.`,
         "info",
       );
 
       pi.sendUserMessage(
-        `You are being asked to help the user modify the active plan. Here is the current plan:\n\n` +
-          `${planContent}\n\n` +
-          `---\n\n` +
-          `## Modification fence\n\n` +
-          `The current step is **Step ${currentStep}**. ` +
+        `You are in **modify-plan investigation mode**. Write and edit are mechanically blocked — you cannot touch any file until the user runs \`/modify-plan-finish\`. Do not attempt to call \`write\` or \`edit\`, and do not run any git commands.
+
+Here is the current plan:
+
+${planContent}
+
+---
+
+## Modification fence
+
+The current step is **Step ${currentStep}**. ` +
           `All non-step sections of the plan (Project Summary, Goals, Architecture, Constraints, Interfaces, Dependencies, Risks, Decision Log, etc.) are freely editable. ` +
           `Within the Steps section, Steps 1 through ${currentStep} (inclusive) are **locked** — they must not be modified under any circumstances. ` +
           `Only steps strictly after Step ${currentStep} may be changed.\n\n` +
           `## Your task\n\n` +
-          `Ask the user what changes they would like to make to the plan. ` +
-          `Do not propose changes yourself or analyze the plan unprompted. ` +
-          `Once the user describes what they want, help them make those changes (updating non-step sections freely, and only touching steps after Step ${currentStep}). ` +
-          `When the modifications are complete, the user will run \`/modify-plan-finish\` to trigger the consistency check, approval loop, commit, and issue updates.`,
+          `Your job right now is to investigate and propose — not to apply any changes. Follow this sequence:\n\n` +
+          `1. Read any files referenced in the plan that are relevant to the area the user wants to change.\n` +
+          `2. Ask the user what changes they want — do not assume or invent a change yourself.\n` +
+          `3. Investigate whether those changes are feasible given the current codebase and plan. Surface any implications, conflicts, or risks.\n` +
+          `4. Ask clarifying questions until the intended change is fully unambiguous — do not proceed on a vague request.\n` +
+          `5. Present a precise proposal describing exactly what would change in the plan and why.\n` +
+          `6. Once the user explicitly confirms the proposal, prompt them to run \`/modify-plan-finish\` to apply it.\n\n` +
+          `Do not edit any files or run git at any point during this session.`,
         { deliverAs: "followUp" },
       );
     },
@@ -1385,19 +1397,21 @@ export default function (pi: ExtensionAPI) {
             `Do NOT run \`gh issue edit\` directly — only the tool is allowed to do that.`
           : `## GitHub issue updates\n\nNo GitHub issues were created for this plan — skip this step.`;
 
+      modifyPlanMode = false;
+
       ctx.ui.notify(
         `Running /modify-plan-finish for plan: ${planPath} (current step: ${currentStep})`,
         "info",
       );
 
       pi.sendUserMessage(
-        `The plan modification session is complete. Please do the following now:\n\n` +
-          `1. **Forward consistency check**: Scan all steps after the earliest modified step through the end of the plan. ` +
-          `Verify that each step is still internally consistent and consistent with the changes made. ` +
-          `Update any steps that are out of sync with the modifications.\n\n` +
-          `2. **User approval**: Present the full set of proposed changes (both the modifications and any consistency updates) to the user for approval. ` +
-          `Incorporate any feedback and loop until the user explicitly approves the final plan.\n\n` +
-          `3. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
+        `The write block has been lifted. You may now edit files and run git commands.\n\n` +
+          `## Your task\n\n` +
+          `Apply the plan changes that were agreed in this conversation. Follow this exact sequence:\n\n` +
+          `1. **Identify the agreed proposal**: Scroll back through this conversation to find the precise proposal the user explicitly confirmed. Apply those changes — and only those changes — to the plan file. Do not invent or add anything beyond what was agreed.\n\n` +
+          `2. **Forward consistency check**: After applying the agreed changes, scan all steps after the earliest modified step through the end of the plan. Verify each is still internally consistent and consistent with the modifications. Update any steps that are out of sync.\n\n` +
+          `3. **User approval**: Present the full diff of changes (both the agreed modifications and any consistency updates) to the user for approval. Incorporate feedback and loop until the user explicitly approves the final plan.\n\n` +
+          `4. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
           `(replace \`<short reason>\` with a concise description of what was changed, e.g. "add retry logic to step 4").\n\n` +
           issueSection,
         { deliverAs: "followUp" },
