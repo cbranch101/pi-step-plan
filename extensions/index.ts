@@ -281,6 +281,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   let planMode = false;
+  // eslint-disable-next-line prefer-const -- reassigned by /modify-plan-start and /modify-plan-finish in Step 3
+  let modifyPlanMode = false;
   let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
   // ── finish_step tool — agent calls this when done with a step ──────────────
@@ -1163,49 +1165,89 @@ export default function (pi: ExtensionAPI) {
 
   // ── Block destructive tools in plan mode ────────────────────────────────────
   pi.on("tool_call", (event, ctx) => {
-    if (!planMode) return;
+    if (!planMode && !modifyPlanMode) return;
 
     if (["write", "edit"].includes(event.toolName)) {
-      // In all plan modes, allow writes anywhere inside docs/
-      const inputPath = (event.input as { path?: string }).path;
-      if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
+      if (planMode) {
+        // In plan mode, allow writes anywhere inside docs/
+        const inputPath = (event.input as { path?: string }).path;
+        if (inputPath && (inputPath.startsWith("docs/") || inputPath.startsWith("/docs/"))) return;
 
-      ctx.ui.notify(
-        `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
-        "warning",
-      );
-      return {
-        block: true,
-        reason:
-          "Plan mode is active. write and edit are disabled outside of docs/. " +
-          "Discuss and plan only — no implementation. Run /plan-finish when done.",
-      };
+        ctx.ui.notify(
+          `⏸ Plan mode: \`${event.toolName}\` blocked. Use /plan-finish to exit planning.`,
+          "warning",
+        );
+        return {
+          block: true,
+          reason:
+            "Plan mode is active. write and edit are disabled outside of docs/. " +
+            "Discuss and plan only — no implementation. Run /plan-finish when done.",
+        };
+      }
+
+      if (modifyPlanMode) {
+        // In modify plan mode, block all paths — no docs/ exception
+        ctx.ui.notify(
+          "⏸ Modify plan mode: write/edit blocked. Run /modify-plan-finish to apply changes.",
+          "warning",
+        );
+        return {
+          block: true,
+          reason:
+            "Modify plan investigation phase is active. write and edit are disabled. " +
+            "Discuss and propose only — run /modify-plan-finish when the user confirms the proposal.",
+        };
+      }
     }
   });
 
   // ── Inject system prompt addition in plan mode ──────────────────────────────
   pi.on("before_agent_start", (event) => {
-    if (!planMode) return;
+    if (!planMode && !modifyPlanMode) return;
 
-    return {
-      systemPrompt:
-        event.systemPrompt +
-        `\n\n## ⏸ PLAN MODE ACTIVE\n` +
-        `You are in a structured planning conversation. Your ONLY job right now is to think, ` +
-        `ask clarifying questions, and discuss the approach.\n` +
-        `\n` +
-        `**You must NOT:**\n` +
-        `- Call write or edit outside of the docs/ directory\n` +
-        `- Start implementing anything\n` +
-        `- Write code in responses unless it is illustrative pseudocode\n` +
-        `\n` +
-        `**You MUST:**\n` +
-        `- Ask questions to fill in gaps before proposing a design\n` +
-        `- Produce a clear, structured plan when asked\n` +
-        `- Stay in discussion mode until the user runs /plan-finish\n` +
-        `\nWhen /plan-finish is called, you will be asked to populate this template from our conversation:\n\n` +
-        PLAN_TEMPLATE,
-    };
+    if (planMode) {
+      return {
+        systemPrompt:
+          event.systemPrompt +
+          `\n\n## ⏸ PLAN MODE ACTIVE\n` +
+          `You are in a structured planning conversation. Your ONLY job right now is to think, ` +
+          `ask clarifying questions, and discuss the approach.\n` +
+          `\n` +
+          `**You must NOT:**\n` +
+          `- Call write or edit outside of the docs/ directory\n` +
+          `- Start implementing anything\n` +
+          `- Write code in responses unless it is illustrative pseudocode\n` +
+          `\n` +
+          `**You MUST:**\n` +
+          `- Ask questions to fill in gaps before proposing a design\n` +
+          `- Produce a clear, structured plan when asked\n` +
+          `- Stay in discussion mode until the user runs /plan-finish\n` +
+          `\nWhen /plan-finish is called, you will be asked to populate this template from our conversation:\n\n` +
+          PLAN_TEMPLATE,
+      };
+    }
+
+    if (modifyPlanMode) {
+      return {
+        systemPrompt:
+          event.systemPrompt +
+          `\n\n## ⏸ MODIFY PLAN MODE — INVESTIGATION ONLY\n` +
+          `You are in the investigation phase of a plan modification. Your ONLY job right now is to ` +
+          `investigate the current state and propose a precise change — do not apply anything.\n` +
+          `\n` +
+          `**You must NOT:**\n` +
+          `- Call write or edit on any path — these are mechanically blocked and will fail\n` +
+          `- Run any git commands or make commits\n` +
+          `- Apply any changes, even ones that seem obviously correct\n` +
+          `\n` +
+          `**You MUST:**\n` +
+          `- Read the plan and any files it references before forming a response\n` +
+          `- Ask the user what they want to change — do not assume\n` +
+          `- Check feasibility against the actual files on disk — do not take the request at face value\n` +
+          `- Ask clarifying questions until the intended change is fully unambiguous\n` +
+          `- Only prompt the user to run /modify-plan-finish once they have explicitly confirmed the proposal\n`,
+      };
+    }
   });
 
   // ── /plan-start ─────────────────────────────────────────────────────────────
