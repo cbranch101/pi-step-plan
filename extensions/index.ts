@@ -1458,9 +1458,15 @@ The current step is **Step ${currentStep}**. ` +
       pi.sendUserMessage(
         `A pre-created plan doc is being adopted. Please do the following:\n\n` +
           `1. Read the plan below carefully.\n` +
-          `2. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
-          `3. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
-          `4. Check the current branch with \`git branch --show-current\`. If it is already \`feature/${slug}\`, skip branch creation. Otherwise run \`git checkout -b feature/${slug} main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
+          `2. Before editing or committing the adopted plan, perform this fail-fast branch setup sequence exactly. If any command fails or any blocking condition is found, stop before editing or committing the plan doc and ask the user how to proceed:\n` +
+          `   a. Verify the working tree is clean with \`git status --porcelain\`; if there is any output, stop and ask the user to commit, stash, or have an agent commit first.\n` +
+          `   b. Run \`git switch main\`.\n` +
+          `   c. Run \`git pull origin main\`.\n` +
+          `   d. Verify local branch \`feature/${slug}\` does not exist (for example, \`git show-ref --verify --quiet refs/heads/feature/${slug}\` must not report an existing branch); if it exists, stop and ask the user how to proceed.\n` +
+          `   e. Verify remote branch \`origin/feature/${slug}\` does not exist (for example, \`git ls-remote --heads origin feature/${slug}\` must return no matching branch); if it exists, stop and ask the user how to proceed.\n` +
+          `   f. Run \`git switch -c feature/${slug}\` from the updated \`main\`. All subsequent plan commits must happen on this branch.\n` +
+          `3. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
+          `4. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
           `5. Once the user approves the plan, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n\n` +
           `## Plan file: ${planPath}\n\n` +
           `## Plan content\n\n${planContent}`,
