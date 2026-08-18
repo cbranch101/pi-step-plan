@@ -16,13 +16,13 @@ The conversation thread is the unit of execution. Each `/next-step` opens a fres
 
 ### Plan lifecycle
 
-| Command          | Description                                                                      |
-| ---------------- | -------------------------------------------------------------------------------- |
+| Command          | Description                                                                            |
+| ---------------- | -------------------------------------------------------------------------------------- |
 | `/plan-start`    | Start planning in discussion mode; run `/plan-finish` when ready to write the plan doc |
 | `/plan-finish`   | Generate, review, commit, and register a new plan on a fresh `feature/<slug>` branch   |
-| `/activate-plan` | Set a plan file as the active plan (reads a path or prompts)                          |
-| `/next-step`     | Dispatch the current active step to the agent in a new thread                         |
-| `/plan-close`    | Archive the plan, commit the archive, then push/create or update the PR               |
+| `/activate-plan` | Set a plan file as the active plan (reads a path or prompts)                           |
+| `/next-step`     | Dispatch the current active step to the agent in a new thread                          |
+| `/plan-close`    | Archive the plan, commit the archive, then push/create or update the PR                |
 | `/plan-adopt`    | Adopt an existing untracked plan file and commit it on a fresh `feature/<slug>` branch |
 
 ### Plan modification
@@ -30,7 +30,7 @@ The conversation thread is the unit of execution. Each `/next-step` opens a fres
 | Command               | Description                                                                                                                                               |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/modify-plan-start`  | Load the active plan into the current thread and instruct the agent to accept modification requests; only steps **after** the current step may be changed |
-| `/modify-plan-finish` | Instruct the agent to run the forward consistency check, get user approval, and commit the updated plan                                                 |
+| `/modify-plan-finish` | Instruct the agent to run the forward consistency check, get user approval, and commit the updated plan                                                   |
 
 > **Note:** `/revise-plan` and `/resume-step` have been removed and replaced by `/modify-plan-start` and `/modify-plan-finish`.
 
@@ -40,11 +40,11 @@ The conversation thread is the unit of execution. Each `/next-step` opens a fres
 
 These tools are exposed to the agent (visible in the system prompt). PR creation follows a confirm-before-act pattern — the user approves the PR package before any `gh` command runs.
 
-| Tool                  | When called                                                                                                           |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `finish_step`         | At the end of a `/next-step` thread; commits the work and advances the step counter                                   |
-| `register_plan`       | During `/plan-finish`; initializes the plan entry in state after the plan doc is committed                            |
-| `get_active_pr`       | Any time; returns current PR metadata (number, URL, state, merged) for the active branch via `gh pr view`             |
+| Tool                  | When called                                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `finish_step`         | At the end of a `/next-step` thread; commits the work and advances the step counter                                       |
+| `register_plan`       | During `/plan-finish`; initializes the plan entry in state after the plan doc is committed                                |
+| `get_active_pr`       | Any time; returns current PR metadata (number, URL, state, merged) for the active branch via `gh pr view`                 |
 | `create_pull_request` | During `/plan-close`; accepts `title`, `body`, and `comments`, pushes the branch, opens/reuses the PR, and posts comments |
 
 ---
