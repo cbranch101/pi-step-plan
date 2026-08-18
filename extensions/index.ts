@@ -133,7 +133,6 @@ Changes not required by these bullets are out of scope for this Step.
 interface PlanProgress {
   currentStep: number;
   completedSteps: number[];
-  githubIssues: number[];
   branch: string | null;
 }
 
@@ -147,7 +146,14 @@ const STATE_FILE = ".pi/plan-state.json";
 
 async function readState(cwd: string): Promise<PlanState> {
   const raw = await readFile(join(cwd, STATE_FILE), "utf8").catch(() => null);
-  return raw ? (JSON.parse(raw) as PlanState) : { activePlan: null, plans: {} };
+  if (!raw) return { activePlan: null, plans: {} };
+
+  try {
+    return JSON.parse(raw) as PlanState;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to parse ${STATE_FILE}: ${msg}`);
+  }
 }
 
 async function writeState(cwd: string, state: PlanState): Promise<void> {
@@ -230,6 +236,54 @@ interface PrCommentInput {
   lines: string;
 }
 
+interface ExecResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function execFileCapture(
+  command: string,
+  args: string[],
+  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
+): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      command,
+      args,
+      {
+        cwd: options.cwd,
+        env: { ...process.env, ...options.env },
+        timeout: options.timeoutMs ?? 120_000,
+      },
+      (error, stdout, stderr) => {
+        const maybeCode = (error as (Error & { code?: unknown }) | null)?.code;
+        const code = typeof maybeCode === "number" ? maybeCode : error ? 1 : 0;
+        const timedOut = error && (error as Error & { killed?: boolean }).killed;
+        const stderrText = String(stderr);
+        resolve({
+          code,
+          stdout: String(stdout),
+          stderr: timedOut
+            ? `${stderrText}${stderrText ? "\n" : ""}${command} timed out waiting for non-interactive completion`
+            : stderrText,
+        });
+      },
+    );
+    child.stdin?.end();
+  });
+}
+
+function gitNoPromptEnv(): NodeJS.ProcessEnv {
+  return {
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "/bin/false",
+    SSH_ASKPASS: "/bin/false",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+  };
+}
+
 function formatPrDraftForConfirm(title: string, body: string, comments: PrCommentInput[]): string {
   const commentBlock =
     comments.length === 0
@@ -281,7 +335,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   let planMode = false;
-  // eslint-disable-next-line prefer-const -- reassigned by /modify-plan-start and /modify-plan-finish in Step 3
+   
   let modifyPlanMode = false;
   let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
@@ -434,363 +488,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── review_issue_outline tool — agent calls this before create_github_issues ──
-  pi.registerTool({
-    name: "review_issue_outline",
-    label: "Review Issue Outline",
-    description:
-      "Call this after the plan doc has been committed, BEFORE drafting full issue bodies. " +
-      "Submit a list of proposed issue titles and one-sentence summaries so the user can approve the shape and granularity of the tickets. " +
-      "If the user requests changes, revise the outline and call this tool again. " +
-      "Only call create_github_issues once this tool returns an approved result.",
-    parameters: Type.Object({
-      issues: Type.Array(
-        Type.Object({
-          title: Type.String({ description: "Issue title" }),
-          summary: Type.String({
-            description: "One-sentence description of the problem this issue addresses",
-          }),
-        }),
-        { description: "Proposed issue titles and summaries for granularity review" },
-      ),
-    }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const outlineText = params.issues
-        .map((issue, i) => `${i + 1}. ${issue.title}\n   ${issue.summary}`)
-        .join("\n\n");
-
-      const confirmed = await ctx.ui.confirm(
-        `Approve this issue outline? (${params.issues.length} issue${params.issues.length !== 1 ? "s" : ""})`,
-        outlineText,
-      );
-
-      if (confirmed) {
-        const approvedList = params.issues
-          .map((issue, i) => `${i + 1}. ${issue.title} — ${issue.summary}`)
-          .join("\n");
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Outline approved by user. Now expand each item into a full issue body and call create_github_issues with the complete bodies.\n\n` +
-                `Approved outline:\n${approvedList}`,
-            },
-          ],
-          details: undefined,
-        };
-      }
-
-      const feedback = await ctx.ui.input(
-        "What changes would you like to the issue outline? (leave blank to cancel)",
-      );
-      return {
-        content: [
-          {
-            type: "text",
-            text: feedback?.trim()
-              ? `User requested changes to the outline: ${feedback.trim()}. Revise the outline and call review_issue_outline again. Do not call create_github_issues yet.`
-              : "User declined the outline without feedback. Revise and call review_issue_outline again.",
-          },
-        ],
-        details: undefined,
-      };
-    },
-  });
-
-  // ── create_github_issues tool — agent calls this after /plan-finish commit ──
-  pi.registerTool({
-    name: "create_github_issues",
-    label: "Create GitHub Issues",
-    description:
-      "Call this after the plan doc has been committed during /plan-finish. " +
-      "Submit drafted GitHub issues for user review; the extension will handle confirmation and creation via gh. " +
-      "Do NOT run gh commands directly. If the tool returns feedback for any issue, revise that issue and call this tool again.",
-    parameters: Type.Object({
-      issues: Type.Array(
-        Type.Object({
-          title: Type.String({ description: "Issue title" }),
-          body: Type.String({ description: "Issue body describing the problem being solved" }),
-        }),
-        { description: "Draft issues to present for user review" },
-      ),
-    }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const createdNumbers: number[] = [];
-      const feedbackItems: string[] = [];
-
-      for (const issue of params.issues) {
-        const confirmed = await ctx.ui.confirm(`Create this issue: "${issue.title}"?`, issue.body);
-
-        if (confirmed) {
-          let ghOutput: string;
-          try {
-            const { code, stdout, stderr } = await pi.exec("gh", [
-              "issue",
-              "create",
-              "--title",
-              issue.title,
-              "--body",
-              issue.body,
-            ]);
-            if (code !== 0) {
-              ctx.ui.notify(`gh issue create failed: ${stderr}`, "error");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `gh issue create failed: ${stderr}. Do not proceed with remaining issues.`,
-                  },
-                ],
-                details: undefined,
-              };
-            }
-            ghOutput = stdout.trim();
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.ui.notify(`gh not available: ${msg}`, "error");
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `gh is not installed or not authenticated: ${msg}. Cannot create issues.`,
-                },
-              ],
-              details: undefined,
-            };
-          }
-
-          // Parse issue number from URL (e.g. https://github.com/owner/repo/issues/42)
-          const urlMatch = ghOutput.match(/\/issues\/(\d+)/);
-          if (urlMatch) {
-            const issueNumber = parseInt(urlMatch[1]!, 10);
-            createdNumbers.push(issueNumber);
-            ctx.ui.notify(`Created issue #${issueNumber}: ${issue.title}`, "info");
-          } else {
-            ctx.ui.notify(`Issue created but could not parse number from: ${ghOutput}`, "warning");
-          }
-        } else {
-          const feedback = await ctx.ui.input(
-            `Any feedback on "${issue.title}"? (leave blank to skip)`,
-          );
-          if (feedback?.trim()) {
-            feedbackItems.push(`- "${issue.title}": ${feedback.trim()}`);
-          }
-        }
-      }
-
-      // Persist created issue numbers into state
-      const freshState = await readState(ctx.cwd);
-      if (freshState.activePlan && freshState.plans[freshState.activePlan]) {
-        const progress = freshState.plans[freshState.activePlan];
-        if (!progress.githubIssues) progress.githubIssues = [];
-        for (const n of createdNumbers) {
-          if (!progress.githubIssues.includes(n)) {
-            progress.githubIssues.push(n);
-          }
-        }
-        await writeState(ctx.cwd, freshState);
-      }
-
-      const createdSummary =
-        createdNumbers.length > 0
-          ? `Created ${createdNumbers.length} issue(s): ${createdNumbers.map((n) => `#${n}`).join(", ")}.`
-          : "No issues were created.";
-
-      if (feedbackItems.length > 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `${createdSummary}\n\n` +
-                `The following issues were declined with feedback — please revise them and call create_github_issues again:\n` +
-                feedbackItems.join("\n"),
-            },
-          ],
-          details: undefined,
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: createdSummary }],
-        details: undefined,
-      };
-    },
-  });
-
-  // ── update_github_issues tool — agent calls this during /modify-plan-finish ──
-  pi.registerTool({
-    name: "update_github_issues",
-    label: "Update GitHub Issues",
-    description:
-      "Call this after the plan doc has been modified during /modify-plan-finish. " +
-      "Submit proposed edits to existing GitHub issues for user review; the extension will handle confirmation and update via gh. " +
-      "Do NOT run gh commands directly. " +
-      "Only issue numbers stored in the plan's githubIssues list are eligible — do NOT pass arbitrary issue numbers. " +
-      "If the tool returns feedback for any issue, revise that issue and call this tool again.",
-    parameters: Type.Object({
-      issues: Type.Array(
-        Type.Object({
-          number: Type.Number({ description: "Existing GitHub issue number" }),
-          title: Type.Optional(Type.String({ description: "New title (omit to leave unchanged)" })),
-          body: Type.Optional(Type.String({ description: "New body (omit to leave unchanged)" })),
-        }),
-        { description: "Proposed edits to present for user review" },
-      ),
-    }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const state = await readState(ctx.cwd);
-      const planPath = state.activePlan;
-
-      if (!planPath || !state.plans[planPath]) {
-        return {
-          content: [
-            { type: "text", text: "No active plan found in state. Cannot update GitHub issues." },
-          ],
-          details: undefined,
-        };
-      }
-
-      const allowedNumbers = state.plans[planPath].githubIssues ?? [];
-
-      // Validate all issue numbers before any UI or gh side effects
-      for (const issue of params.issues) {
-        if (!allowedNumbers.includes(issue.number)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Issue #${issue.number} is not in the githubIssues list for this plan ([${allowedNumbers.join(", ")}]). ` +
-                  `Do not pass arbitrary issue numbers — only numbers returned by create_github_issues for this plan are eligible.`,
-              },
-            ],
-            details: undefined,
-          };
-        }
-      }
-
-      const updatedNumbers: number[] = [];
-      const feedbackItems: string[] = [];
-
-      for (const issue of params.issues) {
-        // Fetch current title and body for diff display
-        let currentTitle = "(unknown)";
-        let currentBody = "(unknown)";
-        try {
-          const { code, stdout } = await pi.exec("gh", [
-            "issue",
-            "view",
-            String(issue.number),
-            "--json",
-            "title,body",
-          ]);
-          if (code === 0) {
-            const data = JSON.parse(stdout) as { title: string; body: string };
-            currentTitle = data.title;
-            currentBody = data.body;
-          }
-        } catch {
-          // Continue with unknown placeholders
-        }
-
-        const diffLines: string[] = [`Issue #${issue.number}`];
-        if (issue.title !== undefined) {
-          diffLines.push(`\nTitle:\n  old: ${currentTitle}\n  new: ${issue.title}`);
-        }
-        if (issue.body !== undefined) {
-          diffLines.push(`\nBody:\n  old:\n${currentBody}\n\n  new:\n${issue.body}`);
-        }
-
-        const confirmed = await ctx.ui.confirm(
-          `Update issue #${issue.number}?`,
-          diffLines.join(""),
-        );
-
-        if (confirmed) {
-          const ghArgs = ["issue", "edit", String(issue.number)];
-          if (issue.title !== undefined) {
-            ghArgs.push("--title", issue.title);
-          }
-          if (issue.body !== undefined) {
-            ghArgs.push("--body", issue.body);
-          }
-
-          try {
-            const { code, stderr } = await pi.exec("gh", ghArgs);
-            if (code !== 0) {
-              ctx.ui.notify(`gh issue edit failed: ${stderr}`, "error");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `gh issue edit failed for #${issue.number}: ${stderr}. Do not proceed with remaining issues.`,
-                  },
-                ],
-                details: undefined,
-              };
-            }
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.ui.notify(`gh not available: ${msg}`, "error");
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `gh is not installed or not authenticated: ${msg}. Cannot update issues.`,
-                },
-              ],
-              details: undefined,
-            };
-          }
-
-          updatedNumbers.push(issue.number);
-          ctx.ui.notify(`Updated issue #${issue.number}`, "info");
-        } else {
-          const feedback = await ctx.ui.input(
-            `Any feedback on issue #${issue.number}? (leave blank to skip)`,
-          );
-          if (feedback?.trim()) {
-            feedbackItems.push(`- #${issue.number}: ${feedback.trim()}`);
-          }
-        }
-      }
-
-      const updatedSummary =
-        updatedNumbers.length > 0
-          ? `Updated ${updatedNumbers.length} issue(s): ${updatedNumbers.map((n) => `#${n}`).join(", ")}.`
-          : "No issues were updated.";
-
-      if (feedbackItems.length > 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `${updatedSummary}\n\n` +
-                `The following issues were declined with feedback — please revise them and call update_github_issues again:\n` +
-                feedbackItems.join("\n"),
-            },
-          ],
-          details: undefined,
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: updatedSummary }],
-        details: undefined,
-      };
-    },
-  });
-
   // ── register_plan tool — agent calls this after committing the plan doc ────────
   pi.registerTool({
     name: "register_plan",
     label: "Register Plan",
     description:
-      "Call this immediately after committing the plan doc during /plan-finish, before creating GitHub issues. " +
-      "Initializes the plan entry in state so issue numbers can be persisted. Does not activate the plan.",
+      "Call this immediately after committing the plan doc during /plan-finish. " +
+      "Initializes the plan entry in state. Does not activate the plan.",
     parameters: Type.Object({
       planPath: Type.String({
         description: "Relative path to the plan doc, e.g. docs/plans/my-plan.md",
@@ -803,7 +507,6 @@ export default function (pi: ExtensionAPI) {
         state.plans[params.planPath] = {
           currentStep: 1,
           completedSteps: [],
-          githubIssues: [],
           branch: params.branch,
         };
         await writeState(ctx.cwd, state);
@@ -875,20 +578,15 @@ export default function (pi: ExtensionAPI) {
     label: "Create Pull Request",
     description:
       "Call this after the cleanup commit during /plan-close. " +
-      "Submit the drafted PR title, structured body, issue numbers from create_github_issues, " +
+      "Submit the drafted PR title, structured body, " +
       "and optional line-anchored review comments (path + lines + body). " +
-      "The extension injects 'closes #N', shows one confirmation for the whole package, then creates the PR and posts one COMMENT review with the inline comments. " +
+      "The extension shows one confirmation for the whole package, then creates the PR and posts one COMMENT review with the inline comments. " +
       "Do NOT run gh commands directly. If the tool returns feedback, revise title/body/comments and call again. " +
       "If PR creation succeeded but review posting failed, call again with the same (or revised) comments to retry the review only — do not open a second PR.",
     parameters: Type.Object({
       title: Type.String({ description: "PR title" }),
       body: Type.String({
-        description:
-          "PR body using sections: Goal, Concepts & decisions, Systems, Test plan. Do not include closes #N — the extension injects those.",
-      }),
-      issueNumbers: Type.Array(Type.Number(), {
-        description:
-          "GitHub issue numbers to close with this PR — pass the numbers returned by create_github_issues. Pass an empty array if no issues were created.",
+        description: "PR body using sections: Goal, Concepts & decisions, Systems, Test plan.",
       }),
       comments: Type.Array(
         Type.Object({
@@ -906,7 +604,6 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const issueNumbers: number[] = params.issueNumbers;
       const comments: PrCommentInput[] = params.comments;
 
       // Validate comments.lines before any UI or gh side effects
@@ -939,10 +636,7 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      const closesLines =
-        issueNumbers.length > 0 ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n") : "";
-      const fullBody = params.body + closesLines;
-      const draftText = formatPrDraftForConfirm(params.title, fullBody, parsedComments);
+      const draftText = formatPrDraftForConfirm(params.title, params.body, parsedComments);
 
       const confirmed = await ctx.ui.confirm(`Create this PR: "${params.title}"?`, draftText);
 
@@ -969,15 +663,21 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Push current branch before attempting PR creation
-      const push = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
+      // Push current branch before attempting PR creation. Use a non-interactive
+      // child process so missing credentials fail instead of stealing the TUI.
+      const push = await execFileCapture("git", ["push", "--set-upstream", "origin", "HEAD"], {
+        cwd: ctx.cwd,
+        env: gitNoPromptEnv(),
+      });
       if (push.code !== 0) {
-        ctx.ui.notify(`git push failed: ${push.stderr}`, "error");
+        const pushMessage =
+          push.stderr.trim() || push.stdout.trim() || `git push exited with code ${push.code}`;
+        ctx.ui.notify(`git push failed: ${pushMessage}`, "error");
         return {
           content: [
             {
               type: "text",
-              text: `git push failed: ${push.stderr}. Resolve the push issue and call create_pull_request again.`,
+              text: `git push failed: ${pushMessage}. Resolve the push issue and call create_pull_request again.`,
             },
           ],
           details: undefined,
@@ -1008,7 +708,7 @@ export default function (pi: ExtensionAPI) {
             "--title",
             params.title,
             "--body",
-            fullBody,
+            params.body,
           ]);
           if (code !== 0) {
             ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
@@ -1282,9 +982,13 @@ export default function (pi: ExtensionAPI) {
           `**a. Extract conversation context**\n` +
           `Review the full conversation above and extract all decisions, goals, constraints, architecture choices, and action items.\n\n` +
           `**b. Choose slug and set up branch**\n` +
-          `Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign"). ` +
-          `Check the current branch with \`git branch --show-current\`. If it is already \`feature/<slug>\`, skip branch creation. ` +
-          `Otherwise run \`git checkout -b feature/<slug> main\` to create and switch to it. All subsequent commits must happen on this branch.\n\n` +
+          `Choose a short kebab-case slug for this plan based on its title (e.g. "auth-refactor", "api-redesign"). Before writing the plan doc, perform this fail-fast branch setup sequence exactly. If any command fails or any blocking condition is found, stop before creating or committing the plan doc and ask the user how to proceed:\n` +
+          `  1. Verify the working tree is clean with \`git status --porcelain\`; if there is any output, stop and ask the user to commit, stash, or have an agent commit first.\n` +
+          `  2. Run \`git switch main\`.\n` +
+          `  3. Run \`git pull origin main\`.\n` +
+          `  4. Verify local branch \`feature/<slug>\` does not exist (for example, \`git show-ref --verify --quiet refs/heads/feature/<slug>\` must not report an existing branch); if it exists, stop and ask the user how to proceed.\n` +
+          `  5. Verify remote branch \`origin/feature/<slug>\` does not exist (for example, \`git ls-remote --heads origin feature/<slug>\` must return no matching branch); if it exists, stop and ask the user how to proceed.\n` +
+          `  6. Run \`git switch -c feature/<slug>\` from the updated \`main\`. All subsequent plan commits must happen on this branch.\n\n` +
           `**c. Write the first-pass plan doc to disk**\n` +
           `Write the populated plan doc to \`${PLANS_DIR}/<slug>.md\` using the template below. ` +
           `Fill in every section from our conversation — do not leave any placeholders.\n\n` +
@@ -1303,16 +1007,8 @@ export default function (pi: ExtensionAPI) {
           `**h. Commit**\n` +
           `Once approved, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
           `**i. Register the plan**\n` +
-          `Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name.\n\n` +
-          `**j. Create GitHub issues**\n` +
-          `After registering, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
-          `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
-          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections. ` +
-          `Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
-          `If the user requests changes, revise the outline and call the tool again. ` +
-          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result. ` +
-          `Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
-          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
+          `Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name. Stop after registering.\n\n` +
+
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
@@ -1391,7 +1087,7 @@ The current step is **Step ${currentStep}**. ` +
   // ── /modify-plan-finish ───────────────────────────────────────────────────
   pi.registerCommand("modify-plan-finish", {
     description:
-      "Trigger forward consistency check, approval loop, commit, and issue updates after plan modification",
+      "Trigger forward consistency check, approval loop, and commit after plan modification",
     handler: async (_args, ctx) => {
       const state = await readState(ctx.cwd);
 
@@ -1403,16 +1099,6 @@ The current step is **Step ${currentStep}**. ` +
       const planPath = state.activePlan;
       const progress = state.plans[planPath];
       const currentStep = progress?.currentStep ?? 1;
-      const githubIssues = progress?.githubIssues ?? [];
-
-      const issueSection =
-        githubIssues.length > 0
-          ? `## GitHub issue updates\n\n` +
-            `The following GitHub issues were created for this plan: [${githubIssues.map((n) => `#${n}`).join(", ")}]. ` +
-            `For each issue, run \`gh issue view <number>\` to read its current content. ` +
-            `Identify any issues affected by the plan changes and call \`update_github_issues\` with proposed edits. ` +
-            `Do NOT run \`gh issue edit\` directly — only the tool is allowed to do that.`
-          : `## GitHub issue updates\n\nNo GitHub issues were created for this plan — skip this step.`;
 
       modifyPlanMode = false;
 
@@ -1429,8 +1115,7 @@ The current step is **Step ${currentStep}**. ` +
           `2. **Forward consistency check**: After applying the agreed changes, scan all steps after the earliest modified step through the end of the plan. Verify each is still internally consistent and consistent with the modifications. Update any steps that are out of sync.\n\n` +
           `3. **User approval**: Present the full diff of changes (both the agreed modifications and any consistency updates) to the user for approval. Incorporate feedback and loop until the user explicitly approves the final plan.\n\n` +
           `4. **Commit**: Once the user approves, run: \`git add -A && git commit -m "plan: modify — <short reason>"\` ` +
-          `(replace \`<short reason>\` with a concise description of what was changed, e.g. "add retry logic to step 4").\n\n` +
-          issueSection,
+          `(replace \`<short reason>\` with a concise description of what was changed, e.g. "add retry logic to step 4").`,
         { deliverAs: "followUp" },
       );
     },
@@ -1481,7 +1166,6 @@ The current step is **Step ${currentStep}**. ` +
         state.plans[planPath] = {
           currentStep: 1,
           completedSteps: [],
-          githubIssues: [],
           branch: `feature/${slug}`,
         };
       }
@@ -1633,9 +1317,21 @@ The current step is **Step ${currentStep}**. ` +
           // ignore parse error — prUrl stays as placeholder
         }
         ctx.ui.notify(`PR already exists: ${prUrl} — pushing...`, "info");
-        const pushResult = await pi.exec("git", ["push"]);
+        const pushResult = await execFileCapture(
+          "git",
+          ["push", "--set-upstream", "origin", "HEAD"],
+          {
+            cwd: ctx.cwd,
+            env: gitNoPromptEnv(),
+          },
+        );
         if (pushResult.code !== 0) {
-          ctx.ui.notify(`git push failed: ${pushResult.stderr}`, "error");
+          const pushMessage =
+            pushResult.stderr.trim() ||
+            pushResult.stdout.trim() ||
+            `git push exited with code ${pushResult.code}`;
+          ctx.ui.notify(`git push failed: ${pushMessage}`, "error");
+          ctx.ui.notify("Resolve the push issue and retry /plan-close or PR creation.", "warning");
           return;
         }
         ctx.ui.notify(`Plan closed and pushed to existing PR: ${prUrl}`, "info");
@@ -1643,11 +1339,6 @@ The current step is **Step ${currentStep}**. ` +
       }
 
       // No PR — trigger agent to draft and call create_pull_request
-      const storedIssueNumbers = state.plans[planPath]?.githubIssues ?? [];
-      const issueNumbersNote =
-        storedIssueNumbers.length > 0
-          ? `The following GitHub issue numbers were created for this plan and must be passed as \`issueNumbers\` to \`create_pull_request\`: [${storedIssueNumbers.join(", ")}].`
-          : `No GitHub issues were created for this plan. Pass an empty array for \`issueNumbers\`.`;
 
       ctx.ui.notify(`No PR found for branch '${branch}' — asking agent to create one.`, "info");
 
@@ -1667,18 +1358,16 @@ The current step is **Step ${currentStep}**. ` +
           `Major modules/commands/tools involved and their role (not a file list).\n\n` +
           `### Test plan\n` +
           `2–4 behavioral checks worth running.\n\n` +
-          `Exclude from the body: commit-by-commit narrative, file walkthroughs. ` +
-          `Do not include \`closes #N\` — the extension injects those from \`issueNumbers\`.\n\n` +
+          `Exclude from the body: commit-by-commit narrative, file walkthroughs.\n\n` +
           `## Review comments (optional)\n\n` +
           `Pass \`comments\` as an array of \`{ body, path, lines }\` for pushback-prone points that belong on a specific hunk. ` +
           `\`lines\` is \`"42"\` (single line) or \`"42-58"\` (inclusive range) on the new-file side of the diff. ` +
           `Heuristic: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren't. ` +
           `Skip routine mechanics and anything that cannot be anchored to a diff hunk. ` +
           `Pass an empty array if there are no such comments.\n\n` +
-          `Then call \`create_pull_request\` with title, body, issueNumbers, and comments. ` +
+          `Then call \`create_pull_request\` with title, body, and comments. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
           `If the tool reports that the PR was created but review posting failed, call \`create_pull_request\` again with the same (or revised) comments to retry the review only — do not open a second PR.\n\n` +
-          `${issueNumbersNote}\n\n` +
           `## Plan name: ${planName}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },
@@ -1825,7 +1514,6 @@ The current step is **Step ${currentStep}**. ` +
       state.plans[planPath] = {
         currentStep: 1,
         completedSteps: [],
-        githubIssues: [],
         branch: `feature/${slug}`,
       };
       state.activePlan = planPath;
@@ -1836,18 +1524,16 @@ The current step is **Step ${currentStep}**. ` +
       pi.sendUserMessage(
         `A pre-created plan doc is being adopted. Please do the following:\n\n` +
           `1. Read the plan below carefully.\n` +
-          `2. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
-          `3. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
-          `4. Check the current branch with \`git branch --show-current\`. If it is already \`feature/${slug}\`, skip branch creation. Otherwise run \`git checkout -b feature/${slug} main\` to create and switch to it. All subsequent commits must happen on this branch.\n` +
-          `5. Once the user approves the plan, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n` +
-          `6. After committing, re-read the committed plan file and decide how to slice it into GitHub issues. ` +
-          `Draft a title and one-sentence summary for each proposed issue — think about the right granularity, ` +
-          `not too broad and not too fine. Issues should represent *problems being solved*, not plan sections.\n` +
-          `7. Call the \`review_issue_outline\` tool with the proposed titles and summaries. ` +
-          `If the user requests changes, revise the outline and call the tool again. ` +
-          `Do NOT call \`create_github_issues\` until \`review_issue_outline\` returns an approved result.\n` +
-          `8. Once the outline is approved, expand each item into a full issue body and call \`create_github_issues\`. ` +
-          `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that.\n\n` +
+          `2. Before editing or committing the adopted plan, perform this fail-fast branch setup sequence exactly. If any command fails or any blocking condition is found, stop before editing or committing the plan doc and ask the user how to proceed:\n` +
+          `   a. Verify the working tree is clean with \`git status --porcelain\`; if there is any output, stop and ask the user to commit, stash, or have an agent commit first.\n` +
+          `   b. Run \`git switch main\`.\n` +
+          `   c. Run \`git pull origin main\`.\n` +
+          `   d. Verify local branch \`feature/${slug}\` does not exist (for example, \`git show-ref --verify --quiet refs/heads/feature/${slug}\` must not report an existing branch); if it exists, stop and ask the user how to proceed.\n` +
+          `   e. Verify remote branch \`origin/feature/${slug}\` does not exist (for example, \`git ls-remote --heads origin feature/${slug}\` must return no matching branch); if it exists, stop and ask the user how to proceed.\n` +
+          `   f. Run \`git switch -c feature/${slug}\` from the updated \`main\`. All subsequent plan commits must happen on this branch.\n` +
+          `3. Present a brief summary to the user and ask if they have any feedback or changes to the plan.\n` +
+          `4. Incorporate any feedback by editing \`${planPath}\` directly. Repeat until the user is satisfied.\n` +
+          `5. Once the user approves the plan, run: \`git add -A && git commit -m "Add plan doc: ${slug}"\`\n\n` +
           `## Plan file: ${planPath}\n\n` +
           `## Plan content\n\n${planContent}`,
         { deliverAs: "followUp" },

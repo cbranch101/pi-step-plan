@@ -1,6 +1,6 @@
 # pi-step-plan
 
-A [pi](https://earendil.works) extension that adds structured, step-by-step plan execution to AI-assisted development. Plans are Markdown documents committed to the repo; the extension provides commands to activate them, dispatch steps to the agent, track progress, manage GitHub issues, and close plans with PRs.
+A [pi](https://earendil.works) extension that adds structured, step-by-step plan execution to AI-assisted development. Plans are Markdown documents committed to feature branches; the extension provides commands to activate them, dispatch steps to the agent, track progress, and close plans by opening or updating PRs.
 
 ---
 
@@ -16,21 +16,21 @@ The conversation thread is the unit of execution. Each `/next-step` opens a fres
 
 ### Plan lifecycle
 
-| Command          | Description                                                                      |
-| ---------------- | -------------------------------------------------------------------------------- |
-| `/plan-start`    | Create a new plan doc from the embedded template and open it in the editor       |
-| `/activate-plan` | Set a plan file as the active plan (reads a path or prompts)                     |
-| `/next-step`     | Dispatch the current active step to the agent in a new thread                    |
-| `/plan-submit`   | Run the cleanup ceremony and open a PR — plan stays active for follow-up commits |
-| `/plan-close`    | Archive the plan and clear state — **blocked unless the PR is already merged**   |
-| `/plan-adopt`    | Adopt an existing plan file that was committed outside the extension             |
+| Command          | Description                                                                            |
+| ---------------- | -------------------------------------------------------------------------------------- |
+| `/plan-start`    | Start planning in discussion mode; run `/plan-finish` when ready to write the plan doc |
+| `/plan-finish`   | Generate, review, commit, and register a new plan on a fresh `feature/<slug>` branch   |
+| `/activate-plan` | Set a plan file as the active plan (reads a path or prompts)                           |
+| `/next-step`     | Dispatch the current active step to the agent in a new thread                          |
+| `/plan-close`    | Archive the plan, commit the archive, then push/create or update the PR                |
+| `/plan-adopt`    | Adopt an existing untracked plan file and commit it on a fresh `feature/<slug>` branch |
 
 ### Plan modification
 
 | Command               | Description                                                                                                                                               |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/modify-plan-start`  | Load the active plan into the current thread and instruct the agent to accept modification requests; only steps **after** the current step may be changed |
-| `/modify-plan-finish` | Instruct the agent to run the forward consistency check, get user approval, commit the updated plan, and update any affected GitHub issues                |
+| `/modify-plan-finish` | Instruct the agent to run the forward consistency check, get user approval, and commit the updated plan                                                   |
 
 > **Note:** `/revise-plan` and `/resume-step` have been removed and replaced by `/modify-plan-start` and `/modify-plan-finish`.
 
@@ -38,17 +38,14 @@ The conversation thread is the unit of execution. Each `/next-step` opens a fres
 
 ## Agent Tools
 
-These tools are exposed to the agent (visible in the system prompt). They follow a confirm-before-act pattern — the user approves each operation via a prompt before any `gh` command runs.
+These tools are exposed to the agent (visible in the system prompt). PR creation follows a confirm-before-act pattern — the user approves the PR package before any `gh` command runs.
 
-| Tool                   | When called                                                                                                |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `finish_step`          | At the end of a `/next-step` thread; commits the work and advances the step counter                        |
-| `review_issue_outline` | During `/plan-finish`; lets the user approve the shape of proposed GitHub issues before bodies are drafted |
-| `create_github_issues` | During `/plan-finish`; drafts and creates GitHub issues after the outline is approved                      |
-| `update_github_issues` | During `/modify-plan-finish`; proposes edits to existing issues with per-issue user confirmation           |
-| `register_plan`        | During `/plan-finish`; initializes the plan entry in state so issue numbers can be persisted               |
-| `get_active_pr`        | Any time; returns current PR metadata (number, URL, state, merged) for the active branch via `gh pr view`  |
-| `create_pull_request`  | During `/plan-submit`; drafts and opens the PR, then posts inline review comments                          |
+| Tool                  | When called                                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `finish_step`         | At the end of a `/next-step` thread; commits the work and advances the step counter                                       |
+| `register_plan`       | During `/plan-finish`; initializes the plan entry in state after the plan doc is committed                                |
+| `get_active_pr`       | Any time; returns current PR metadata (number, URL, state, merged) for the active branch via `gh pr view`                 |
+| `create_pull_request` | During `/plan-close`; accepts `title`, `body`, and `comments`, pushes the branch, opens/reuses the PR, and posts comments |
 
 ---
 
@@ -63,7 +60,6 @@ These tools are exposed to the agent (visible in the system prompt). They follow
   └─ agent: forward consistency check across all steps after the earliest changed step
   └─ agent: present diff to user for approval; loop until approved
   └─ agent: git commit the updated plan
-  └─ agent: if githubIssues non-empty → call update_github_issues for affected issues
 ```
 
 **Fence rule:** completed steps and the active step are locked. Only steps strictly after `currentStep` may be modified. This is enforced by agent instructions, not mechanically.
@@ -75,18 +71,17 @@ These tools are exposed to the agent (visible in the system prompt). They follow
 ## Execution Model
 
 - Plans are committed Markdown files; the extension reads and writes them via the filesystem.
-- State (active plan path, current step number, GitHub issue numbers) is persisted by the extension in pi's state store.
+- State (active plan path, current step number, completed steps, and feature branch) is persisted by the extension in pi's state store.
 - Each `/next-step` dispatch sends the step recipe to the agent in a new conversation thread; the agent calls `finish_step` when done.
 - Sub-step numbering (`1.1`, `1.2`) is allowed in plan prose; the step parser (`findStepByNumber`) handles whole-number steps only — sub-steps are treated as prose inside their parent step.
 
-### Two-stage PR lifecycle
+### Branch and PR lifecycle
 
-`/plan-submit` and `/plan-close` are intentionally separate commands:
+`/plan-finish` and `/plan-adopt` put each plan on a dedicated feature branch before the plan commit. The agent must verify a clean working tree, switch to hard-coded `main`, pull `origin main`, reject any existing local or remote `feature/<slug>` branch, then create `feature/<slug>` from the updated `main`. If the tree is dirty, the branch already exists, or any git command fails, the workflow stops before plan creation/adoption is committed and asks the user how to proceed.
 
-- **`/plan-submit`** — runs the cleanup ceremony (repo doc updates, cleanup commit, `create_pull_request`) and then **keeps the plan active**. The branch, step counter, and GitHub issue numbers remain in state so follow-up commits (`/next-step` cycles, manual fixes) can be pushed into the same PR.
-- **`/plan-close`** — a merge gate. It calls `gh pr view` to confirm the PR has been merged; if not, it warns and returns. Once merged, it archives the plan file to `docs/plans/reference/` and clears `activePlan` from state. No cleanup ceremony is run — that already happened at submit time.
+`/plan-close` archives the active plan into `docs/plans/reference/`, commits that cleanup, pushes the feature branch to `origin`, and creates or reuses a pull request. `create_pull_request` receives only the PR `title`, `body`, and optional inline review `comments`; it does not add issue-closing footers.
 
-Running `/plan-submit` on a branch that already has an open PR skips the ceremony and notifies the user with the existing PR URL.
+This extension does not create GitHub repositories or configure remotes. Configure `origin` yourself before using workflows that need `git pull origin main`, `git push`, or `gh pr create`.
 
 ---
 
@@ -107,30 +102,21 @@ docs/
 ## Example Plan Workflow
 
 ```bash
-# 1. Create and edit a plan
+# 1. Discuss and shape a plan
 /plan-start
 
-# 2. Activate it (if not already active)
-/activate-plan
+# 2. Finish the plan on a fresh feature branch from updated main
+/plan-finish   # clean tree → switch main → pull origin main → create feature/<slug> → commit/register plan
 
-# 3. Create GitHub issues for the plan
-/plan-finish   # (review_issue_outline → create_github_issues)
-
-# 4. Execute steps one at a time
+# 3. Execute steps one at a time
 /next-step     # dispatches Step 1; agent calls finish_step when done
 /next-step     # dispatches Step 2; ...
 
-# 5. If you need to change a future step mid-execution
+# 4. If you need to change a future step mid-execution
 /modify-plan-start    # load plan + fence instructions into thread
 # ... describe changes; agent edits plan ...
-/modify-plan-finish   # consistency check → approval → commit → issue updates
+/modify-plan-finish   # consistency check → approval → commit
 
-# 6. Submit the PR (plan stays active for follow-up commits)
-/plan-submit   # cleanup commit + create_pull_request; plan remains active
-
-# 7. Push any follow-up commits in response to code review
-/next-step     # or just make commits directly to the branch
-
-# 8. Close the plan only after the PR has been merged
-/plan-close    # merge-gated: archives plan → docs/plans/reference/ + clears state
+# 5. Close the plan and create/update the PR
+/plan-close    # archives plan → commits → pushes branch → create_pull_request as needed
 ```
