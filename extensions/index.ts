@@ -280,11 +280,8 @@ function gitNoPromptEnv(): NodeJS.ProcessEnv {
     GCM_INTERACTIVE: "Never",
     GIT_ASKPASS: "/bin/false",
     SSH_ASKPASS: "/bin/false",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
   };
-}
-
-function githubHttpsRewriteArgs(): string[] {
-  return ["-c", "url.https://github.com/.insteadOf=git@github.com:"];
 }
 
 function formatPrDraftForConfirm(title: string, body: string, comments: PrCommentInput[]): string {
@@ -668,14 +665,10 @@ export default function (pi: ExtensionAPI) {
 
       // Push current branch before attempting PR creation. Use a non-interactive
       // child process so missing credentials fail instead of stealing the TUI.
-      const push = await execFileCapture(
-        "git",
-        [...githubHttpsRewriteArgs(), "push", "--set-upstream", "origin", "HEAD"],
-        {
-          cwd: ctx.cwd,
-          env: gitNoPromptEnv(),
-        },
-      );
+      const push = await execFileCapture("git", ["push", "--set-upstream", "origin", "HEAD"], {
+        cwd: ctx.cwd,
+        env: gitNoPromptEnv(),
+      });
       if (push.code !== 0) {
         const pushMessage =
           push.stderr.trim() || push.stdout.trim() || `git push exited with code ${push.code}`;
@@ -1326,7 +1319,7 @@ The current step is **Step ${currentStep}**. ` +
         ctx.ui.notify(`PR already exists: ${prUrl} — pushing...`, "info");
         const pushResult = await execFileCapture(
           "git",
-          [...githubHttpsRewriteArgs(), "push", "--set-upstream", "origin", "HEAD"],
+          ["push", "--set-upstream", "origin", "HEAD"],
           {
             cwd: ctx.cwd,
             env: gitNoPromptEnv(),
