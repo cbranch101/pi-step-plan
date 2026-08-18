@@ -618,12 +618,14 @@ export default function (pi: ExtensionAPI) {
       // Push current branch before attempting PR creation
       const push = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
       if (push.code !== 0) {
-        ctx.ui.notify(`git push failed: ${push.stderr}`, "error");
+        const pushMessage =
+          push.stderr.trim() || push.stdout.trim() || `git push exited with code ${push.code}`;
+        ctx.ui.notify(`git push failed: ${pushMessage}`, "error");
         return {
           content: [
             {
               type: "text",
-              text: `git push failed: ${push.stderr}. Resolve the push issue and call create_pull_request again.`,
+              text: `git push failed: ${pushMessage}. Resolve the push issue and call create_pull_request again.`,
             },
           ],
           details: undefined,
@@ -1263,9 +1265,14 @@ The current step is **Step ${currentStep}**. ` +
           // ignore parse error — prUrl stays as placeholder
         }
         ctx.ui.notify(`PR already exists: ${prUrl} — pushing...`, "info");
-        const pushResult = await pi.exec("git", ["push"]);
+        const pushResult = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
         if (pushResult.code !== 0) {
-          ctx.ui.notify(`git push failed: ${pushResult.stderr}`, "error");
+          const pushMessage =
+            pushResult.stderr.trim() ||
+            pushResult.stdout.trim() ||
+            `git push exited with code ${pushResult.code}`;
+          ctx.ui.notify(`git push failed: ${pushMessage}`, "error");
+          ctx.ui.notify("Resolve the push issue and retry /plan-close or PR creation.", "warning");
           return;
         }
         ctx.ui.notify(`Plan closed and pushed to existing PR: ${prUrl}`, "info");
