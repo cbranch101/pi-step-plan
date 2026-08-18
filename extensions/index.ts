@@ -530,20 +530,15 @@ export default function (pi: ExtensionAPI) {
     label: "Create Pull Request",
     description:
       "Call this after the cleanup commit during /plan-close. " +
-      "Submit the drafted PR title, structured body, issue numbers, " +
+      "Submit the drafted PR title, structured body, " +
       "and optional line-anchored review comments (path + lines + body). " +
-      "The extension injects 'closes #N', shows one confirmation for the whole package, then creates the PR and posts one COMMENT review with the inline comments. " +
+      "The extension shows one confirmation for the whole package, then creates the PR and posts one COMMENT review with the inline comments. " +
       "Do NOT run gh commands directly. If the tool returns feedback, revise title/body/comments and call again. " +
       "If PR creation succeeded but review posting failed, call again with the same (or revised) comments to retry the review only — do not open a second PR.",
     parameters: Type.Object({
       title: Type.String({ description: "PR title" }),
       body: Type.String({
-        description:
-          "PR body using sections: Goal, Concepts & decisions, Systems, Test plan. Do not include closes #N — the extension injects those.",
-      }),
-      issueNumbers: Type.Array(Type.Number(), {
-        description:
-          "Issue numbers to close with this PR. Pass an empty array if no issues should be closed.",
+        description: "PR body using sections: Goal, Concepts & decisions, Systems, Test plan.",
       }),
       comments: Type.Array(
         Type.Object({
@@ -561,7 +556,6 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const issueNumbers: number[] = params.issueNumbers;
       const comments: PrCommentInput[] = params.comments;
 
       // Validate comments.lines before any UI or gh side effects
@@ -594,10 +588,7 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      const closesLines =
-        issueNumbers.length > 0 ? "\n\n" + issueNumbers.map((n) => `closes #${n}`).join("\n") : "";
-      const fullBody = params.body + closesLines;
-      const draftText = formatPrDraftForConfirm(params.title, fullBody, parsedComments);
+      const draftText = formatPrDraftForConfirm(params.title, params.body, parsedComments);
 
       const confirmed = await ctx.ui.confirm(`Create this PR: "${params.title}"?`, draftText);
 
@@ -663,7 +654,7 @@ export default function (pi: ExtensionAPI) {
             "--title",
             params.title,
             "--body",
-            fullBody,
+            params.body,
           ]);
           if (code !== 0) {
             ctx.ui.notify(`gh pr create failed: ${stderr}`, "error");
@@ -1301,15 +1292,14 @@ The current step is **Step ${currentStep}**. ` +
           `Major modules/commands/tools involved and their role (not a file list).\n\n` +
           `### Test plan\n` +
           `2–4 behavioral checks worth running.\n\n` +
-          `Exclude from the body: commit-by-commit narrative, file walkthroughs. ` +
-          `Do not include \`closes #N\` — the extension injects those from \`issueNumbers\`.\n\n` +
+          `Exclude from the body: commit-by-commit narrative, file walkthroughs.\n\n` +
           `## Review comments (optional)\n\n` +
           `Pass \`comments\` as an array of \`{ body, path, lines }\` for pushback-prone points that belong on a specific hunk. ` +
           `\`lines\` is \`"42"\` (single line) or \`"42-58"\` (inclusive range) on the new-file side of the diff. ` +
           `Heuristic: close alternatives, intentional quirks, contract/state-shape changes, things that look like bugs but aren't. ` +
           `Skip routine mechanics and anything that cannot be anchored to a diff hunk. ` +
           `Pass an empty array if there are no such comments.\n\n` +
-          `Then call \`create_pull_request\` with title, body, issueNumbers, and comments. ` +
+          `Then call \`create_pull_request\` with title, body, and comments. ` +
           `Do NOT run any \`gh\` commands directly — only the tool is allowed to do that. ` +
           `If the tool reports that the PR was created but review posting failed, call \`create_pull_request\` again with the same (or revised) comments to retry the review only — do not open a second PR.\n\n` +
           `## Plan name: ${planName}\n\n` +
