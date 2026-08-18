@@ -236,6 +236,54 @@ interface PrCommentInput {
   lines: string;
 }
 
+interface ExecResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function execFileCapture(
+  command: string,
+  args: string[],
+  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
+): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      command,
+      args,
+      {
+        cwd: options.cwd,
+        env: { ...process.env, ...options.env },
+        timeout: options.timeoutMs ?? 120_000,
+      },
+      (error, stdout, stderr) => {
+        const maybeCode = (error as (Error & { code?: unknown }) | null)?.code;
+        const code = typeof maybeCode === "number" ? maybeCode : error ? 1 : 0;
+        const timedOut = error && (error as Error & { killed?: boolean }).killed;
+        const stderrText = String(stderr);
+        resolve({
+          code,
+          stdout: String(stdout),
+          stderr: timedOut
+            ? `${stderrText}${stderrText ? "\n" : ""}${command} timed out waiting for non-interactive completion`
+            : stderrText,
+        });
+      },
+    );
+    child.stdin?.end();
+  });
+}
+
+function gitNoPromptEnv(): NodeJS.ProcessEnv {
+  return {
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "/bin/false",
+    SSH_ASKPASS: "/bin/false",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+  };
+}
+
 function formatPrDraftForConfirm(title: string, body: string, comments: PrCommentInput[]): string {
   const commentBlock =
     comments.length === 0
@@ -615,8 +663,12 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Push current branch before attempting PR creation
-      const push = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
+      // Push current branch before attempting PR creation. Use a non-interactive
+      // child process so missing credentials fail instead of stealing the TUI.
+      const push = await execFileCapture("git", ["push", "--set-upstream", "origin", "HEAD"], {
+        cwd: ctx.cwd,
+        env: gitNoPromptEnv(),
+      });
       if (push.code !== 0) {
         const pushMessage =
           push.stderr.trim() || push.stdout.trim() || `git push exited with code ${push.code}`;
@@ -1265,7 +1317,14 @@ The current step is **Step ${currentStep}**. ` +
           // ignore parse error — prUrl stays as placeholder
         }
         ctx.ui.notify(`PR already exists: ${prUrl} — pushing...`, "info");
-        const pushResult = await pi.exec("git", ["push", "--set-upstream", "origin", "HEAD"]);
+        const pushResult = await execFileCapture(
+          "git",
+          ["push", "--set-upstream", "origin", "HEAD"],
+          {
+            cwd: ctx.cwd,
+            env: gitNoPromptEnv(),
+          },
+        );
         if (pushResult.code !== 0) {
           const pushMessage =
             pushResult.stderr.trim() ||
