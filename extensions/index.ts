@@ -292,50 +292,25 @@ function formatPrDraftForConfirm(title: string, body: string, comments: PrCommen
   return `Title: ${title}\n\nBody:\n${body}\n\nComments (${comments.length}):\n${commentBlock}`;
 }
 
-// ─── Notifications ───────────────────────────────────────────────────────────
+// ─── Completion navigation ───────────────────────────────────────────────────
 
-function notifyOSC777(title: string, body: string): void {
-  process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
-}
+function activateGhostty(): void {
+  if (process.platform !== "darwin") return;
 
-function notifyOSC99(title: string, body: string): void {
-  process.stdout.write(`\x1b]99;i=1:d=0;${title}\x1b\\`);
-  process.stdout.write(`\x1b]99;i=1:p=body;${body}\x1b\\`);
-}
-
-function notifyWindows(title: string, body: string): void {
-  const type = "Windows.UI.Notifications";
-  const mgr = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
-  const template = `[${type}.ToastTemplateType]::ToastText01`;
-  const toast = `[${type}.ToastNotification]::new($xml)`;
-  const script = [
-    `${mgr} > $null`,
-    `$xml = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
-    `$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('${body}')) > $null`,
-    `[${type}.ToastNotificationManager]::CreateToastNotifier('${title}').Show(${toast})`,
-  ].join("; ");
-  execFile("powershell.exe", ["-NoProfile", "-Command", script]);
-}
-
-function notify(title: string, body: string): void {
-  if (process.env.WT_SESSION) {
-    notifyWindows(title, body);
-  } else if (process.env.KITTY_WINDOW_ID) {
-    notifyOSC99(title, body);
-  } else {
-    notifyOSC777(title, body);
-  }
+  execFile("osascript", ["-e", 'tell application "Ghostty" to activate'], () => {
+    // Navigation feedback must never affect the agent lifecycle.
+  });
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  pi.on("agent_end", () => {
-    notify("Pi", "Ready for input");
+  pi.on("agent_settled", () => {
+    activateGhostty();
   });
 
   let planMode = false;
-   
+
   let modifyPlanMode = false;
   let activeStepNumber: number | null = null; // non-null only while a step is dispatched
 
@@ -1008,7 +983,6 @@ export default function (pi: ExtensionAPI) {
           `Once approved, run: \`git add -A && git commit -m "Add plan doc: <slug>"\`\n\n` +
           `**i. Register the plan**\n` +
           `Immediately after committing, call \`register_plan\` with the plan path (e.g. \`${PLANS_DIR}/<slug>.md\`) and the current branch name. Stop after registering.\n\n` +
-
           `Here is the template:\n\n${PLAN_TEMPLATE}`,
         { deliverAs: "followUp" },
       );
