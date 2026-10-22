@@ -85,6 +85,20 @@ This extension does not create GitHub repositories or configure remotes. Configu
 
 ---
 
+## macOS Media Pause
+
+On macOS, when the agent settles, the extension checks the current Now Playing session and pauses it if it is actively playing before returning focus to Ghostty. This is best effort: the feature is skipped when `nowplaying-cli` is unavailable, and media control failures do not affect the agent lifecycle.
+
+Install the optional helper with Homebrew:
+
+```bash
+brew install nowplaying-cli
+```
+
+`nowplaying-cli` uses private macOS media APIs, so support may change with future macOS releases.
+
+---
+
 ## Repository Layout
 
 ```

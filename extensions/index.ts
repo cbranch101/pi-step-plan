@@ -294,18 +294,52 @@ function formatPrDraftForConfirm(title: string, body: string, comments: PrCommen
 
 // ─── Completion navigation ───────────────────────────────────────────────────
 
-function activateGhostty(): void {
+function pauseActiveMedia(done: () => void): void {
+  if (process.platform !== "darwin") {
+    done();
+    return;
+  }
+
+  execFile("nowplaying-cli", ["get", "playbackRate"], { timeout: 1_000 }, (error, stdout) => {
+    const playbackRate = Number.parseFloat(String(stdout).trim());
+    const isPlaying = !error && Number.isFinite(playbackRate) && playbackRate > 0;
+
+    if (!isPlaying) {
+      done();
+      return;
+    }
+
+    execFile("nowplaying-cli", ["pause"], { timeout: 1_000 }, () => {
+      // Media control is best effort and must never affect the agent lifecycle.
+      done();
+    });
+  });
+}
+
+function activateGhostty(pauseMedia = false): void {
   if (process.platform !== "darwin") return;
 
-  execFile("osascript", ["-e", 'tell application "Ghostty" to activate'], () => {
-    // Navigation feedback must never affect the agent lifecycle.
-  });
+  const activate = () => {
+    execFile("osascript", ["-e", 'tell application "Ghostty" to activate'], () => {
+      // Navigation feedback must never affect the agent lifecycle.
+    });
+  };
+
+  if (pauseMedia) {
+    pauseActiveMedia(activate);
+  } else {
+    activate();
+  }
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", () => {
+    pauseActiveMedia(() => activateGhostty());
+  });
+
+  pi.on("ui_prompt_start", () => {
     activateGhostty();
   });
 
